@@ -240,6 +240,8 @@ impl TextFile {
                 }
                 Op::SetCell { .. }
                 | Op::InsertTable { .. }
+                | Op::DeleteTable { .. }
+                | Op::DeleteControl { .. }
                 | Op::InsertTextInCell { .. }
                 | Op::DeleteTextInCell { .. } => {
                     bail!("{step}번째 연산: 텍스트 파일에는 표가 없습니다 — {}", op.describe());

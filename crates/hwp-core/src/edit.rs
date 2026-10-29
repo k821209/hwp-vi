@@ -79,6 +79,44 @@ pub enum Op {
     InsertTextInCell { table: u32, row: usize, col: usize, cell_para: usize, offset: usize, text: String },
     /// `edit delete-text-in-cell` — 칸 안 문단에서 글자를 지운다.
     DeleteTextInCell { table: u32, row: usize, col: usize, cell_para: usize, offset: usize, count: usize },
+    /// `edit delete-table` — 표를 지운다. **단락은 남는다.**
+    ///
+    /// 사용자 보고(2026-10-29): 다른 세션이 HWPX 의 zip 을 풀어 XML 을 직접
+    /// 고쳐 양식을 채웠고, 거기서 "작성방법 쪽·안 쓰는 칸·첨부 1 을 문단째
+    /// 지웠다". 우리는 **개체 달린 단락 삭제를 거부**해서 그 일을 할 수 없었고,
+    /// 그래서 사용자가 자가검증이 **아예 없는** 경로로 밀려났다. 세 번째였다
+    /// (`set-cell` 한 줄 제한 → XML, 칸 문단 좌표 없음 → XML, 이번).
+    ///
+    /// 거부한 이유는 "개체를 만들 수 없으니 그렇게 되어야 한다 를 쓸 수 없다"
+    /// 였는데, 재 보니 **표는 쓸 수 있다.** 실측(s03.hwpx, 표 13개):
+    ///
+    /// - 본문 단락 수 **60 → 60** — 표가 올라앉은 단락은 **남는다**(빈 단락으로)
+    /// - 표 13 → 12, 뒤쪽 번호가 당겨진다 (t3 → t2 …)
+    /// - 남은 표의 단락 좌표는 **그대로** (0:15 는 0:15)
+    /// - 단락 글자는 하나도 안 바뀐다
+    ///
+    /// **처음엔 단락도 같이 빠지는 줄 알았다.** `read:["text"]` 의 `body` 가
+    /// 73 → 72 로 줄어든 것을 보고 그렇게 읽었는데, 그 하나는 단락이 아니라
+    /// `body` 안의 **표 항목**이었다. 틀린 기대값으로 저장을 걸었고
+    /// **자가검증이 멈춰 세웠다**("기대 59 / 실제 60"). 파일은 안 바뀌었다 —
+    /// 이 장치가 막으려는 것이 정확히 이 종류의 틀림이다.
+    ///
+    /// `at` 은 그 표가 올라앉은 단락이다. 증인은 표의 앵커를 모르므로
+    /// (백엔드가 말해 준다) 부르는 쪽이 넣어 준다 — `InsertTable` 과 같다.
+    DeleteTable { at: Coord, table: u32 },
+    /// `edit delete-control` — 단락이 담은 **개체 하나만** 지운다. 단락은 남는다.
+    ///
+    /// 실측: 그림 하나 든 단락에 걸면 단락 수는 그대로고 그림만 빠진다
+    /// (s00.hwp 단락 54, 단락 196→196 · 그림 6→5). 그래서 **개체를 먼저 빼고
+    /// 빈 단락을 평범하게 지우는** 두 걸음이 된다 — 두 걸음 다 검증을 지난다.
+    ///
+    /// `ctrl` 은 그 단락 안에서의 개체 번호(0부터)다. 개체가 **하나뿐인** 단락은
+    /// 0 이 유일한 답이라 안전하고, 여럿인 단락은 부르는 쪽이 번호를 알아야
+    /// 한다 — 표·그림·글상자가 한 줄에 섞여 번호를 공유하기 때문이다.
+    ///
+    /// `kept` 는 지운 뒤 그 단락에 남아야 하는 개체 수다. 부르는 쪽이 세어
+    /// 적고, 틀리면 저장이 멈춘다 — `InsertTable` 의 `index` 와 같은 자리다.
+    DeleteControl { at: Coord, ctrl: usize, kept: usize },
 }
 
 /// 표 셀 좌표 — rhwp `--table/--row/--col`.
@@ -183,6 +221,17 @@ impl Op {
                 "--count".into(), count.to_string(),
                 "-o".into(), output.into(),
             ],
+            Op::DeleteTable { table, .. } => vec![
+                "edit".into(), "delete-table".into(), input.into(),
+                "--table".into(), table.to_string(),
+                "-o".into(), output.into(),
+            ],
+            Op::DeleteControl { at, ctrl, .. } => vec![
+                "edit".into(), "delete-control".into(), input.into(),
+                "--section".into(), s(at.0), "--para".into(), s(at.1),
+                "--ctrl".into(), ctrl.to_string(),
+                "-o".into(), output.into(),
+            ],
             Op::InsertTable { at, rows, cols, .. } => vec![
                 "edit".into(), "insert-table".into(), input.into(),
                 "--rows".into(), rows.to_string(),
@@ -214,6 +263,13 @@ impl Op {
                     lines[0]
                 ),
             },
+            Op::DeleteTable { at, table } => {
+                format!("구역{} 단락{} 의 표{table} 지우기 (단락은 빈 채로 남습니다)", at.0, at.1)
+            }
+            Op::DeleteControl { at, ctrl, kept } => format!(
+                "구역{} 단락{} 의 개체 {ctrl}번 지우기 (단락은 남고 개체 {kept}개)",
+                at.0, at.1
+            ),
             Op::InsertTextInCell { table, row, col, cell_para, offset, text } => format!(
                 "표{table} ({row},{col}) 문단{cell_para} 의 {offset}번째에 {text:?} 넣기"
             ),
@@ -614,6 +670,79 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 *p = next;
                 *slot = paras.join("\n");
             }
+            Op::DeleteTable { at, table } => {
+                // 표 번호가 당겨지는 것은 `InsertTable` 의 거울이다. 다만
+                // **단락은 빠지지 않는다** — 넣을 때는 표와 단락이 함께 들어오고,
+                // 지울 때는 표만 나가고 빈 단락이 남는다. 대칭이 아니다.
+                // (그 비대칭을 모르고 짰다가 자가검증에 걸렸다. 변종 주석 참고.)
+                if !cur.paras.contains_key(at) {
+                    bail!("없는 단락입니다: 구역{} 단락{}", at.0, at.1);
+                }
+                if !cur.cells.keys().any(|(tb, _, _)| tb == table) {
+                    bail!("없는 표입니다: 표{table}");
+                }
+                // 앵커는 부르는 쪽이 넣어 준다(증인은 표의 앵커를 모른다). 그러니
+                // **여기서 한 번 본다** — 틀린 앵커로 내려가면 저장은 성공하고
+                // 기대값만 어긋나서 "이 단락의 글자가 다르다" 같은 엉뚱한 차이가
+                // 쏟아진다. 실제로 그렇게 나온 적이 있다.
+                if cur.drawings.get(at).copied().unwrap_or(0) == 0 {
+                    bail!(
+                        "구역{} 단락{} 에는 그리기개체가 없습니다 — 표{table} 가 올라앉은 \
+                         단락이 맞는지 보세요",
+                        at.0, at.1
+                    );
+                }
+                // **단락은 남는다** — 좌표를 밀지 않는다. 그 단락이 들고 있던
+                // 개체만 하나 줄어든다.
+                match cur.drawings.get(at).copied().unwrap_or(0) {
+                    0 | 1 => {
+                        cur.drawings.remove(at);
+                    }
+                    n => {
+                        cur.drawings.insert(*at, n - 1);
+                    }
+                }
+                cur.cells = std::mem::take(&mut cur.cells)
+                    .into_iter()
+                    .filter(|((tb, _, _), _)| tb != table)
+                    .map(|((tb, r, c), v)| ((if tb > *table { tb - 1 } else { tb }, r, c), v))
+                    .collect();
+            }
+            Op::DeleteControl { at, ctrl, kept } => {
+                // **단락은 남는다** (실측: 단락 196→196, 그림 6→5). 글자와 좌표는
+                // 손대지 않고 개체 수만 줄인다 — 그러면 그 다음에 빈 단락을
+                // 평범한 `DeleteParagraph` 로 지울 수 있고, 두 걸음 다 검증을
+                // 지난다. 전에는 개체 달린 단락을 아예 거부해서, 양식의 안 쓰는
+                // 칸을 지우려는 사람이 **검증 없는 경로로 밀려났다.**
+                let have = cur.drawings.get(at).copied().unwrap_or(0);
+                if have == 0 {
+                    bail!("구역{} 단락{} 에는 지울 개체가 없습니다", at.0, at.1);
+                }
+                if *ctrl >= have {
+                    bail!(
+                        "구역{} 단락{} 에는 개체가 {have}개인데 {ctrl}번을 지우려 합니다 \
+                         (번호는 0부터)",
+                        at.0, at.1
+                    );
+                }
+                // `kept` 는 부르는 쪽이 **세어 적는 칸**이다 (`InsertTable` 의
+                // `index` 와 같은 자리). 틀리면 여기서 멈춘다 — 개체 수는 증인이
+                // 다시 세는 값이므로, 적어 둔 수가 틀렸다는 것은 부르는 쪽이
+                // 문서를 잘못 보고 있다는 뜻이다.
+                if *kept + 1 != have {
+                    bail!(
+                        "구역{} 단락{} 에는 개체가 {have}개입니다 — 하나 지우면 {}개가 \
+                         남는데 {kept}개로 적었습니다",
+                        at.0, at.1,
+                        have - 1
+                    );
+                }
+                if *kept == 0 {
+                    cur.drawings.remove(at);
+                } else {
+                    cur.drawings.insert(*at, *kept);
+                }
+            }
             Op::InsertTable { at, rows, cols, index } => {
                 // 표와 함께 **단락 하나**가 들어간다
                 cur.paras = shift(cur.paras, at.0, at.1, 1);
@@ -651,9 +780,10 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 if let Some(n) = cur.drawings.get(at).copied().filter(|&n| n > 0) {
                     bail!(
                         "구역{} 단락{} 에는 그리기개체(표·그림·글상자)가 {n}개 달려 있어 \
-                         지울 수 없다. 지우면 그 개체도 함께 사라지는데, 이 도구는 개체를 \
-                         만들거나 옮기지 못해서 결과를 검증할 수 없다 — 글자만 지우려면 \
-                         `delete-text`(또는 `set-para` 로 빈 글자)를 쓰라.",
+                         단락째 지울 수 없습니다. 개체를 먼저 빼면 됩니다 — \
+                         표면 `delete-table`(표와 단락을 함께 지웁니다), 그림·글상자면 \
+                         `delete-control` 로 개체를 빼고 남은 빈 단락을 지우세요. \
+                         글자만 지우려면 `delete-text` 나 `set-para` 로 빈 글자를 쓰면 됩니다.",
                         at.0,
                         at.1
                     );

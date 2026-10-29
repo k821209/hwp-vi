@@ -198,6 +198,30 @@ pub enum OpSpec {
     Relevel { section: u32, para: u32, delta: isize },
     /// **빈 표를 만든다** — 그 자리에 단락 하나가 함께 들어간다.
     InsertTable { section: u32, para: u32, rows: usize, cols: usize },
+    /// **표를 지운다** — 단락은 빈 채로 남는다(이어서 `delete-para`).
+    ///
+    /// 사용자 보고(2026-10-29): 양식에서 "작성방법 쪽·안 쓰는 칸·첨부 1 을
+    /// 문단째" 지워야 했는데 길이 없어서 HWPX 의 XML 을 직접 고치게 됐다.
+    /// 그 경로는 자가검증을 타지 않는다.
+    ///
+    /// 앵커(어느 단락인지)는 **우리가 찾는다** — `tables` 가 이미 `section`/
+    /// `para` 를 들고 있으므로 기계가 또 적을 이유가 없고, 적게 하면 틀린
+    /// 앵커를 받을 길이 생긴다.
+    DeleteTable { table: u32 },
+    /// **단락이 담은 개체 하나만 지운다** — 단락은 남는다.
+    ///
+    /// 그림·글상자를 뺄 때 쓴다. 뺀 뒤 남은 빈 단락은 평범한 `delete-para` 로
+    /// 지울 수 있다(개체가 있는 동안은 거부된다). 표는 이쪽이 아니라
+    /// `delete-table` 로 간다 — 개체 번호만으로는 표인지 그림인지 알 수 없고,
+    /// 표를 이쪽으로 지우면 칸이 남은 기대값이 만들어진다.
+    DeleteControl {
+        section: u32,
+        para: u32,
+        /// 그 단락 안의 개체 번호(0부터). 개체가 하나인 단락은 0 이 유일한
+        /// 답이라 생략해도 된다.
+        #[serde(default)]
+        ctrl: usize,
+    },
 }
 
 // ---------------------------------------------------------------- 할 수 있는 일
@@ -296,6 +320,20 @@ pub const CAPS: &[Cap] = &[
         id: "delete-text-in-cell",
         what: "표 칸 안의 한 문단에서 글자를 지운다 — 좌표는 `insert-text-in-cell` 과 같다",
         machine: Machine::Op("delete-text-in-cell"),
+        ex: &[],
+    },
+    Cap {
+        id: "delete-table",
+        what: "표를 지운다 — 단락은 빈 채로 남으므로 `delete-para` 로 이어 지운다 \
+               (양식의 안 쓰는 칸)",
+        machine: Machine::Op("delete-table"),
+        ex: &[],
+    },
+    Cap {
+        id: "delete-control",
+        what: "단락이 담은 그림·글상자 하나를 지운다 — 단락은 남는다. \
+               뺀 뒤 빈 단락은 `delete-para` 로",
+        machine: Machine::Op("delete-control"),
         ex: &[],
     },
     Cap {
@@ -920,7 +958,15 @@ fn apply_ops(
     // (백엔드가 말해 준다) 그 조회가 공짜가 아니라, 쓸 때만 구한다.
     let anchors: Vec<(u32, u32, u32)> = if specs
         .iter()
-        .any(|s| matches!(s, OpSpec::InsertTable { .. }))
+        .any(|s| {
+            matches!(
+                s,
+                // `DeleteControl` 도 앵커가 **반드시** 있어야 한다. 표 든 단락을
+                // 거부하는 관문이 앵커로 판단하므로, 앵커가 비면 그 관문이
+                // 조용히 통과한다 — 관문이 꺼진 것을 아무도 모르는 모양이다.
+                OpSpec::InsertTable { .. } | OpSpec::DeleteTable { .. } | OpSpec::DeleteControl { .. }
+            )
+        })
     {
         let doc = hwp_core::json::build(rhwp, target, hwp_core::json::Profile::Doc)?;
         let mut v: Vec<(u32, u32, u32)> = doc
@@ -948,7 +994,7 @@ fn apply_ops(
     let mut log = EditLog::new();
     let mut applied = Vec::new();
     let mut shifts: Vec<Shift> = Vec::new();
-    let mut table_shifts: Vec<u32> = Vec::new();
+    let mut table_shifts: Vec<TableShift> = Vec::new();
 
     for spec in specs {
         let (ops, said) = lower(spec, &cur, &anchors)?;
@@ -969,8 +1015,15 @@ fn apply_ops(
                 // 바뀌었다" 가 된다(처음에 그렇게 나왔다).
                 Op::InsertTable { at, index, .. } => {
                     shifts.push(Shift { section: at.0, para: at.1, insert: true });
-                    table_shifts.push(*index);
+                    table_shifts.push(TableShift { index: *index, insert: true });
                 }
+                // **표를 지워도 단락은 남는다** — 그러니 단락 쪽 `Shift` 는
+                // 적지 않는다. 표 번호만 당겨진다.
+                Op::DeleteTable { table, .. } => {
+                    table_shifts.push(TableShift { index: *table, insert: false });
+                }
+                // `DeleteControl` 은 단락도 표도 건드리지 않는다 — 개체 수만
+                // 줄어들고, 그건 비교 단위가 아니다. 적을 것이 없다.
                 _ => {}
             }
         }
@@ -1035,6 +1088,8 @@ fn op_name(spec: &OpSpec) -> &'static str {
         OpSpec::CheckInCell { .. } => "check-in-cell",
         OpSpec::Relevel { .. } => "relevel",
         OpSpec::InsertTable { .. } => "insert-table",
+        OpSpec::DeleteTable { .. } => "delete-table",
+        OpSpec::DeleteControl { .. } => "delete-control",
     }
 }
 
@@ -1302,6 +1357,52 @@ fn lower(
             text_at(*section, *para)?;
             (vec![Op::DeleteParagraph { at: (*section, *para) }], None)
         }
+        OpSpec::DeleteTable { table } => {
+            if !cur.cells.keys().any(|(tb, _, _)| tb == table) {
+                anyhow::bail!("없는 표다: 표{table}");
+            }
+            // **앵커를 우리가 찾는다.** `tables` 가 이미 들고 있는 값이라
+            // 기계가 또 적을 이유가 없고, 적게 하면 틀린 앵커를 받을 길이
+            // 생긴다 — 틀린 앵커는 저장을 성공시키고 기대값만 어긋낸다.
+            let at = anchors
+                .iter()
+                .find(|(idx, _, _)| idx == table)
+                .map(|(_, s, p)| (*s, *p))
+                .with_context(|| {
+                    format!("표{table} 가 어느 단락에 올라앉았는지 찾지 못했다")
+                })?;
+            (vec![Op::DeleteTable { at, table: *table }], None)
+        }
+        OpSpec::DeleteControl { section, para, ctrl } => {
+            // 개체 수는 증인이 세는 값이다. **우리가 세어서 넣는다** — 기계가
+            // 적게 하면 틀린 수를 받을 길이 생기고, 그 수는 검증의 기준이다.
+            let have = cur.drawings.get(&(*section, *para)).copied().unwrap_or(0);
+            if have == 0 {
+                anyhow::bail!(
+                    "구역{section} 단락{para} 에는 지울 개체가 없다 \
+                     (개체가 어디 있는지는 `read: [\"images\"]` 와 `tables` 가 말한다)"
+                );
+            }
+            // **표를 이쪽으로 지우지 못하게 막는다.** 개체 번호만으로는 표인지
+            // 그림인지 알 수 없고, 표를 이쪽으로 지우면 칸이 남은 기대값이
+            // 만들어져 저장이 "표0 의 글자가 다르다" 로 멈춘다 — 엉뚱한 말이다.
+            if let Some((idx, _, _)) = anchors.iter().find(|(_, s, p)| (*s, *p) == (*section, *para))
+            {
+                anyhow::bail!(
+                    "구역{section} 단락{para} 에는 표{idx} 가 올라앉아 있다 — \
+                     `delete-table` 로 지워라 (표가 빠지고 이 단락은 빈 채로 남는다. \
+                     그 다음 `delete-para` 로 지우면 된다)"
+                );
+            }
+            (
+                vec![Op::DeleteControl {
+                    at: (*section, *para),
+                    ctrl: *ctrl,
+                    kept: have - 1,
+                }],
+                Some(format!("개체 {have}개 중 {ctrl}번을 지웁니다 — {}개 남습니다", have - 1)),
+            )
+        }
         OpSpec::InsertTable { section, para, rows, cols } => {
             if *rows == 0 || *cols == 0 {
                 anyhow::bail!("행과 열은 1 이상이어야 한다 (받은 값: {rows}×{cols})");
@@ -1381,6 +1482,17 @@ fn levels_of(snap: &Snapshot) -> hwp_core::outline::Levels {
     hwp_core::outline::Levels::build(&items)
 }
 
+/// 표 번호가 밀리거나 당겨진 자리. 단락 쪽 [`Shift`] 와 같은 꼴이다.
+///
+/// 전에는 `Vec<u32>`(넣은 자리)뿐이었다. 지우는 연산이 생기니 **방향을 말할
+/// 수 없어서**, 표를 하나 지우면 "그 뒤 표 전부가 바뀌었다" 가 된다 — 넣을
+/// 때 이미 한 번 당한 모양이다.
+#[derive(Debug, Clone, Copy)]
+struct TableShift {
+    index: u32,
+    insert: bool,
+}
+
 /// 넣고 뺀 자리. 비교할 때 좌표를 맞추는 데 쓴다.
 #[derive(Debug, Clone, Copy)]
 struct Shift {
@@ -1399,7 +1511,7 @@ fn diff_json(
     before: &Snapshot,
     after: &Snapshot,
     shifts: &[Shift],
-    table_shifts: &[u32],
+    table_shifts: &[TableShift],
 ) -> Vec<Value> {
     let mut out = Vec::new();
 
@@ -1488,9 +1600,13 @@ fn diff_json(
     // 되는데, 실제로는 **그 표가 표4 로 옮겨 간** 것뿐이다.
     let old_tables: BTreeSet<u32> = before.cells.keys().map(|k| k.0).collect();
     let mut origin: Vec<Option<u32>> = old_tables.iter().copied().map(Some).collect();
-    for &idx in table_shifts {
-        let at = (idx as usize).min(origin.len());
-        origin.insert(at, None);
+    for sh in table_shifts {
+        let at = (sh.index as usize).min(origin.len());
+        if sh.insert {
+            origin.insert(at, None);
+        } else if at < origin.len() {
+            origin.remove(at);
+        }
     }
     let new_tables: Vec<u32> = after.cells.keys().map(|k| k.0).collect::<BTreeSet<_>>()
         .into_iter()

@@ -3791,6 +3791,141 @@ fn toggling_a_checkbox_keeps_the_character_formatting_of_that_glyph() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **양식의 안 쓰는 칸을 지우는 길이 있어야 한다 — 검증을 지나는 길로.**
+///
+/// 사용자 보고(2026-10-29): 다른 세션이 HWPX 의 zip 을 풀어 XML 을 직접 고쳐
+/// 양식을 채웠고, 거기서 "작성방법 쪽·안 쓰는 칸·첨부 1 을 문단째 지웠다".
+/// 우리는 개체 달린 단락 삭제를 **거부**했으므로 그 일을 할 수 없었고, 그래서
+/// 사용자가 자가검증이 **아예 없는** 경로로 밀려났다. 세 번째였다.
+///
+/// 이 시험이 지키는 것은 **두 걸음 길**이다 — 표를 지우면 빈 단락이 남고, 그
+/// 단락은 이제 평범하게 지울 수 있다(개체가 있는 동안은 거부된다).
+///
+/// 그리고 지우는 쪽은 **번호가 당겨진다**: 표3 을 지우면 표4 가 표3 이 된다.
+/// 그 셈이 틀리면 "그 뒤 표 전부가 바뀌었다" 가 되는데, 넣을 때 이미 한 번
+/// 당했다.
+#[test]
+fn deleting_a_table_leaves_an_empty_paragraph_that_can_then_be_deleted() {
+    let Some(((rhwp, _), files)) = backend().zip(Some(samples())) else { return };
+    // 표가 **둘 이상**인 문서여야 번호 당기기를 볼 수 있다
+    let Some((src, anchors)) = files.iter().find_map(|f| {
+        let t = Testimony::read(f).ok()?;
+        (t.tables.len() >= 2).then(|| {
+            let a: Vec<u32> = t.tables.iter().map(|tb| tb.index).collect();
+            (f.clone(), a)
+        })
+    }) else {
+        panic!("표가 둘 이상인 문서가 코퍼스에 없다 — 이 시험은 그 문서가 있어야 뜻이 있다");
+    };
+
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-deltable-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let doc = dir.join(src.file_name().expect("이름"));
+    std::fs::copy(&src, &doc).expect("문서");
+
+    // 지울 표와 그 앵커 — 앵커는 증인이 모르므로 백엔드에게 묻는다
+    let victim = anchors[0];
+    let built = hwp_core::json::build(&rhwp, &doc, hwp_core::json::Profile::Full).expect("문서");
+    let at = built
+        .tables
+        .as_ref()
+        .and_then(|ts| {
+            ts.iter()
+                .find(|x| x.id.trim_start_matches('t').parse::<u32>().ok() == Some(victim))
+                .map(|x| (x.section, x.para))
+        })
+        .expect("표 앵커");
+
+    let before = Testimony::read(&doc).expect("증인");
+    let n_tables = before.tables.len();
+    let n_paras = before.body_paragraphs().len();
+    // 지울 표 **다음** 표의 첫 칸 글자 — 번호가 당겨졌는지 이것으로 본다
+    let next_first_cell = before
+        .tables
+        .iter()
+        .find(|tb| tb.index == victim + 1)
+        .and_then(|tb| tb.cells.iter().find(|c| c.row == 0 && c.col == 0))
+        .map(|c| c.text.clone());
+
+    let mut log = hwp_core::edit::EditLog::new();
+    log.push(hwp_core::edit::Op::DeleteTable { at, table: victim });
+    hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("표 지우기: {e:#}"));
+
+    let mid = Testimony::read(&doc).expect("증인");
+    assert_eq!(mid.tables.len(), n_tables - 1, "표가 하나 줄어야 한다");
+    // **단락은 남는다.** 넣을 때는 표와 단락이 함께 들어오지만 지울 때는 표만
+    // 나간다 — 그 비대칭을 모르고 짰다가 자가검증에 걸렸다.
+    assert_eq!(
+        mid.body_paragraphs().len(),
+        n_paras,
+        "표를 지워도 단락 수는 그대로여야 한다"
+    );
+    // **번호가 당겨졌는가.**
+    if let Some(want) = next_first_cell {
+        let now = mid
+            .tables
+            .iter()
+            .find(|tb| tb.index == victim)
+            .and_then(|tb| tb.cells.iter().find(|c| c.row == 0 && c.col == 0))
+            .map(|c| c.text.clone());
+        assert_eq!(now, Some(want), "지운 표 다음 표가 그 번호로 당겨져야 한다");
+    }
+
+    // **이제 그 빈 단락을 지울 수 있다.** 개체가 있는 동안은 거부된다.
+    let mut log2 = hwp_core::edit::EditLog::new();
+    log2.push(hwp_core::edit::Op::DeleteParagraph { at });
+    hwp_core::edit::save(&rhwp, &doc, &log2)
+        .unwrap_or_else(|e| panic!("표를 뺀 뒤 빈 단락 지우기: {e:#}"));
+    let after = Testimony::read(&doc).expect("증인");
+    assert_eq!(
+        after.body_paragraphs().len(),
+        n_paras - 1,
+        "빈 단락이 지워져야 한다"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **개체가 달린 단락은 여전히 거부한다 — 다만 갈 곳을 말해 준다.**
+///
+/// 지우는 길이 생겼다고 거부를 푸는 것이 아니다. 개체를 먼저 빼지 않으면 그
+/// 개체가 조용히 사라지고(실측: s00.hwp 단락 54, 그림 6→5), 우리는 개체를
+/// 만들 수 없으므로 "그렇게 되어야 한다" 를 쓸 수 없다. 거부는 남기고,
+/// **어디로 가야 하는지**를 메시지가 말한다.
+#[test]
+fn a_paragraph_that_holds_a_drawing_still_refuses_but_names_the_way_out() {
+    let Some(((rhwp, _), files)) = backend().zip(Some(samples())) else { return };
+    let Some((src, at)) = files.iter().find_map(|f| {
+        let t = Testimony::read(f).ok()?;
+        let snap = hwp_core::edit::snapshot(&t);
+        snap.drawings
+            .iter()
+            .find(|&(_, &n)| n > 0)
+            .map(|(coord, _)| (f.clone(), *coord))
+    }) else {
+        panic!("개체가 달린 단락이 있는 문서가 코퍼스에 없다");
+    };
+
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-refuse-draw-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let doc = dir.join(src.file_name().expect("이름"));
+    std::fs::copy(&src, &doc).expect("문서");
+
+    let mut log = hwp_core::edit::EditLog::new();
+    log.push(hwp_core::edit::Op::DeleteParagraph { at });
+    let e = hwp_core::edit::save(&rhwp, &doc, &log)
+        .expect_err("개체 달린 단락은 거부되어야 한다");
+    let msg = format!("{e:#}");
+    // **갈 곳을 말하는가.** 전에는 "검증할 수 없다" 로 끝나서, 받는 쪽이 할 수
+    // 있는 일이 없었다 — 그래서 도구 밖으로 나갔다.
+    assert!(
+        msg.contains("delete-table") && msg.contains("delete-control"),
+        "거부만 하고 갈 곳을 말하지 않는다: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// **코퍼스는 무엇을 못 재는지 스스로 말해야 한다.**
 ///
 /// 이 저장소의 1번 재발 패턴은 "시험을 깔끔하게 하려고 걸러낸 것이 결함이 사는
