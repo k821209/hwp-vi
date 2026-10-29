@@ -1,0 +1,41 @@
+# rhwp 백엔드 고정 — PLAN.md §8-5
+#
+# rhwp 는 v1.0 조판 엔진 체계화 중이라 JSON 스키마가 움직일 수 있다.
+# 그래서 버전과 sha256 을 고정하고, 기동 시 capabilities 로 호환성을 확인한다.
+# 비호환이면 조용히 오동작하지 말고 명확히 거부한다.
+
+[rhwp]
+version        = "0.8.7"
+schema_version = "1.0"          # capabilities.schemaVersion — major 가 다르면 거부
+release_url    = "https://github.com/edwardkim/rhwp/releases/download/v0.8.7"
+
+# 이 명령들이 capabilities.commands 에 있고 json=true 여야 한다.
+# 실측으로 전수 확인됨 (Runs 탭 hwp-format-probe).
+required_commands = [
+  "info", "explain", "digest",
+  "dump-pages", "export-text", "export-structure", "export-tables",
+  "fields", "edit", "batch", "armor", "convert",
+]
+
+# tarball sha256
+#
+# **상류가 같은 태그의 산출물을 교체했다 (실측 2026-10-13).** v0.8.7 이라는
+# 태그는 그대로인데 다섯 개 타르볼의 sha256 이 전부 바뀌어, 깨끗한 클론에서
+# fetch-rhwp.sh 가 모든 플랫폼에서 설치를 거부했다. 핀이 제 일을 한 것이다.
+#
+# 바꿔치기 전에 새 바이너리가 옛것과 같이 도는지 재고 갱신했다:
+#   - capabilities 98개 명령 중 `export-png` 가 꺼짐→켜짐. 나머지 전부 동일,
+#     빠진 기능 없음 (상류가 PNG 내보내기를 켜서 다시 빌드한 것으로 보인다)
+#   - 읽기: 23문서 × 6명령 = 138/138 바이트 동일
+#   - 쓰기(edit): 6문서 × 5연산 = 30/30 동일
+#   - 우리 시험 236개 전부 통과 (HWP_RHWP_BIN 으로 새 바이너리를 끼워서)
+#
+# **태그는 불변이 아니다.** 상류가 이미 공개한 태그를 다시 빌드해 덮을 수 있으니,
+# 설치가 sha256 불일치로 멈추면 "받다가 깨졌다" 로 읽지 말고 먼저 상류의
+# SHA256SUMS.txt 를 받아 대조하라. 다르면 교체된 것이고, 그때는 해시만 고쳐
+# 넣지 말고 위 네 줄을 다시 재고 나서 갱신한다.
+[rhwp.artifacts]
+"linux-aarch64"  = { file = "rhwp-v0.8.7-linux-aarch64.tar.gz",  sha256 = "c4a70f5ed11b99586ee89d1ac9069145d58a0831d00e87858bb01626e2ebf313" }
+"linux-x86_64"   = { file = "rhwp-v0.8.7-linux-x86_64.tar.gz",   sha256 = "f1e541a25cfe76b6bc1daf18bf9c1f9a5ac5e03e2c01b188daaf54107214f631" }
+"macos-aarch64"  = { file = "rhwp-v0.8.7-macos-aarch64.tar.gz",  sha256 = "6ed46aa63f6d10c447842999f73abc59cf9586c5645fefc5e763bd6a6d43662d" }
+"macos-x86_64"   = { file = "rhwp-v0.8.7-macos-x86_64.tar.gz",   sha256 = "07b1a5ea570e410d1b52b4d848a94f00c64674e84004883c62efad7daab61da4" }

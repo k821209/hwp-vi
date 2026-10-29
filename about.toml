@@ -1,0 +1,35 @@
+# 공개 배포에 붙이는 제3자 고지(`THIRD-PARTY.md`)를 만드는 설정.
+#
+# `accepted` 는 **선호 순서**다. `MIT OR Apache-2.0` 처럼 고를 수 있는 경우
+# 앞에 적힌 것이 선택된다. OR 로 고를 수 있는데도 더 센 조건을 받아들이면
+# 고지가 실제보다 무거워지므로, LGPL·MPL 은 **일부러 넣지 않았다** — 둘 다
+# `MIT OR …` 형태로만 나타나서 MIT 로 고르면 되고, 목록에 넣어 두면
+# "이 배포가 LGPL 을 포함한다" 로 읽히는 고지가 나온다.
+#
+# AND 로 묶여 선택권이 없는 것(`(MIT OR Apache-2.0) AND Unicode-3.0`)은
+# 반드시 있어야 한다 — 빠지면 `--fail` 이 거부한다. 그게 이 설정의 쓸모다.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    # 선택권이 없어서 반드시 받아들여야 하는 것들
+    "Unicode-3.0",        # unicode-ident
+    "Unicode-DFS-2016",   # finl_unicode, wezterm-bidi
+    "Zlib",               # zlib-rs, foldhash
+    # 단일 라이선스이거나 OR 의 유일한 선택지
+    "0BSD",               # adler2
+    "BSD-3-Clause",       # moxcms, pxfm
+    "BSL-1.0",            # ryu (Apache-2.0 OR BSL-1.0 — Apache 를 고른다)
+    "WTFPL",              # terminfo
+    "Unlicense",
+]
+
+# 배포하는 것은 실행 파일이다 — 시험에만 쓰이는 크레이트는 그 안에 없다.
+ignore-dev-dependencies = true
+# 빌드 때만 돌고 실행 파일에 들어가지 않는 것도 마찬가지.
+ignore-build-dependencies = true
+
+# 우리 크레이트 자신은 LICENSE 가 따로 있다.
+[hwp-core]
+accepted = ["MIT"]
+[hwp-cli]
+accepted = ["MIT"]
