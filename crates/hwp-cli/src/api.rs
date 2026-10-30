@@ -770,9 +770,12 @@ pub fn run(req: Request) -> Result<Value> {
             );
         }
         if req.dry_run {
-            // 미리보기는 **명세를 읽어 보기만** 한다. 백엔드를 부르지 않으므로
-            // 디스크에 아무것도 생기지 않는다.
-            let plan = hwp_core::create::plan(spec)?;
+            // 미리보기도 **실제로 만들어 보고 버린다** (임시 디렉터리에서).
+            // 사용자가 준 경로는 건드리지 않는다 — 그게 원래 약속이고, 명세
+            // 검증은 그 약속을 깨지 않고도 된다. hwp-vi#3.
+            let pin = Pin::load_default()?;
+            let rhwp = Rhwp::discover(&pin)?;
+            let plan = hwp_core::create::plan(&rhwp, spec)?;
             out.insert("output".into(), json!(dest.display().to_string()));
             out.insert("outputWritten".into(), json!(false));
             out.insert("dryRun".into(), json!(true));
@@ -811,7 +814,22 @@ pub fn run(req: Request) -> Result<Value> {
     // 쓰기가 있으면 먼저 대상 파일을 정한다 — 읽기는 **바뀐 뒤**를 보여주는
     // 쪽이 쓸모 있다(쓰고 나서 무엇이 되었는지 확인하는 흐름이다).
     let has_ops = !req.ops.is_empty();
-    let target = match &req.output {
+    // **`output` 은 목적지 옆 임시본에서 만들고 성공할 때만 옮긴다.**
+    //
+    // 전에는 입력을 목적지로 **바로 복사한 뒤** 거기에 연산을 적용했다. 두 가지
+    // 가 틀렸다:
+    //
+    // 1. 연산이 실패하면 목적지에 **입력의 바이트 사본**이 남았다
+    //    (사용자 보고 hwp-vi#2). 스크립트가 `output` 의 존재나 mtime 으로
+    //    성공을 판단하면 **아무것도 반영되지 않은 파일을 결과물로 집어 든다.**
+    // 2. `overwrite: true` 면 **검증 전에** 목적지가 덮였다. 연산이 실패하면
+    //    거기 있던 문서는 이미 사라진 뒤다 — 앞서 막은 쓰기 파괴 경로와
+    //    같은 모양이고, 그 목록에서 빠져 있었다.
+    //
+    // 임시본은 **목적지 옆**에 둔다. 다른 파일시스템에 두면 마지막 `rename` 이
+    // 복사가 되고, 끊기면 반쪽 파일이 자리에 남는다.
+    let mut landing: Option<PathBuf> = None;
+    let mut target = match &req.output {
         Some(dest) => {
             // 형식 검사는 **사람 쪽 `:w <경로>` 와 같은 함수**를 쓴다.
             // 둘에 따로 적으면 한쪽이 빠지고, 빠진 쪽이 변환을 통과시킨다.
@@ -849,10 +867,18 @@ pub fn run(req: Request) -> Result<Value> {
                         dest.display()
                     );
                 }
-                std::fs::copy(&file, dest)
-                    .with_context(|| format!("{} 로 복사할 수 없다", dest.display()))?;
+                let ext = dest.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
+                let stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+                let tmp = dest
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(format!(".{stem}.hwpapi.{ext}"));
+                let _ = std::fs::remove_file(&tmp);
+                std::fs::copy(&file, &tmp)
+                    .with_context(|| format!("{} 로 복사할 수 없다", tmp.display()))?;
+                landing = Some(dest.clone());
                 out.insert("output".into(), json!(dest.display().to_string()));
-                dest.clone()
+                tmp
             }
         }
         None => file.clone(),
@@ -861,13 +887,62 @@ pub fn run(req: Request) -> Result<Value> {
     if has_ops {
         let pin = Pin::load_default()?;
         let rhwp = Rhwp::discover(&pin)?;
-        let (applied, changed, saved) = apply_ops(&rhwp, &target, &req.ops, req.dry_run)?;
+        // **실패하면 우리가 만든 `output` 사본을 치운다.**
+        //
+        // 사용자 보고(hwp-vi#2): 저장이 멈춘 요청(`ok: false`)인데 `output`
+        // 경로에 **입력의 바이트 사본**이 남았다. 원본과 원자성은 지켜졌지만,
+        // 스크립트가 `output` 의 존재나 mtime 으로 성공을 판단하는 것은 흔한
+        // 습관이고 그러면 **아무것도 반영되지 않은 파일을 결과물로 집어 든다.**
+        // 조용히 틀리는 쪽이 제일 비싸다는 이 저장소의 기준에 그대로 걸린다.
+        //
+        // 사본은 연산을 **거기에 적용하려고** 미리 만든 것이므로, 적용이 실패
+        // 하면 존재할 이유가 없다. 원래 있던 파일(`overwrite`)은 건드리지
+        // 않는다 — 우리가 만든 것만 치운다.
+        let r = apply_ops(&rhwp, &target, &req.ops, req.dry_run);
+        let (applied, changed, saved) = match r {
+            Ok(v) => v,
+            Err(e) => {
+                // 임시본은 치운다. 목적지는 **손도 대지 않았다.**
+                if landing.is_some() {
+                    let _ = std::fs::remove_file(&target);
+                }
+                return Err(e);
+            }
+        };
         out.insert("applied".into(), json!(applied));
         out.insert("changed".into(), json!(changed));
         match saved {
             Some(v) => out.insert("saved".into(), v),
             None => out.insert("dryRun".into(), json!(true)),
         };
+        // 통과했으니 자리에 놓는다. 이어지는 읽기는 목적지에서 본다.
+        if let Some(dest) = landing.take() {
+            // **임시본의 `.bak` 은 치운다.** `edit::save` 가 자기 입력(= 우리
+            // 사본)의 백업을 만드는데, 그건 원본의 백업이 아니라 **방금 만든
+            // 사본의 백업**이라 뜻이 없고 목적지 옆에 쓰레기로 남는다.
+            for suffix in ["", ".1", ".2"] {
+                let bak = PathBuf::from(format!("{}.bak{suffix}", target.display()));
+                if bak.is_file() {
+                    let _ = std::fs::remove_file(&bak);
+                }
+            }
+            std::fs::rename(&target, &dest)
+                .with_context(|| format!("{} 로 옮길 수 없다", dest.display()))?;
+            // **응답이 가리키는 경로를 목적지로 고친다.** 임시본 경로를 주면
+            // 받는 쪽이 없는 파일을 가리키게 된다.
+            if let Some(Value::Object(s)) = out.get_mut("saved") {
+                s.insert("path".into(), json!(dest.display().to_string()));
+                s.remove("backup");
+            }
+            target = dest;
+        }
+    }
+
+    // **연산 없이 `output` 만 준 요청**도 자리에 놓는다 (그냥 사본이다).
+    if let Some(dest) = landing.take() {
+        std::fs::rename(&target, &dest)
+            .with_context(|| format!("{} 로 옮길 수 없다", dest.display()))?;
+        target = dest;
     }
 
     let mut wants: BTreeSet<String> = req.read.iter().map(|s| s.trim().to_lowercase()).collect();
@@ -893,7 +968,10 @@ pub fn run(req: Request) -> Result<Value> {
     if !wants.is_empty() {
         let pin = Pin::load_default()?;
         let rhwp = Rhwp::discover(&pin)?;
-        let profile = if want("tables") || all {
+        // `checks` 도 **표 목록이 필요하다** — 각 항목이 쓸 수 있는 좌표인지를
+        // 백엔드의 표 목록으로 가른다(hwp-vi#1). 빠뜨리면 목록이 비어 전부
+        // "못 쓴다" 로 표시된다 — 조용히 거꾸로 말하는 꼴이다.
+        let profile = if want("tables") || want("checks") || all {
             hwp_core::json::Profile::Full
         } else if want("text") {
             hwp_core::json::Profile::Doc
@@ -948,7 +1026,18 @@ pub fn run(req: Request) -> Result<Value> {
             out.insert("symbols".into(), json!(symbols_json()));
         }
         if want("checks") {
-            out.insert("checks".into(), json!(checks_json(&target)?));
+            // 백엔드가 **편집으로 받는** 표 번호. `tables` 와 같은 출처다.
+            let writable: BTreeSet<u32> = d
+                .get("tables")
+                .and_then(|v| v.as_array())
+                .map(|ts| {
+                    ts.iter()
+                        .filter_map(|x| x.get("id").and_then(|i| i.as_str()))
+                        .filter_map(|id| id.trim_start_matches('t').parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.insert("checks".into(), json!(checks_json(&target, &writable)?));
         }
     }
 
@@ -1028,7 +1117,18 @@ fn apply_ops(
                 // `DeleteControl` 도 앵커가 **반드시** 있어야 한다. 표 든 단락을
                 // 거부하는 관문이 앵커로 판단하므로, 앵커가 비면 그 관문이
                 // 조용히 통과한다 — 관문이 꺼진 것을 아무도 모르는 모양이다.
-                OpSpec::InsertTable { .. } | OpSpec::DeleteTable { .. } | OpSpec::DeleteControl { .. }
+                OpSpec::InsertTable { .. }
+                    | OpSpec::DeleteTable { .. }
+                    | OpSpec::DeleteControl { .. }
+                    // **칸을 가리키는 연산도 앵커가 필요하다.** 증인은 중첩
+                    // 표의 칸도 들고 있는데 백엔드 편집은 최상위 표만 받는다.
+                    // 앵커(= 백엔드의 표 목록)로 미리 걸러 주지 않으면,
+                    // `dryRun` 이 통과하고 저장이 백엔드 오류로 깨진다
+                    // (hwp-vi#1).
+                    | OpSpec::SetCell { .. }
+                    | OpSpec::InsertTextInCell { .. }
+                    | OpSpec::DeleteTextInCell { .. }
+                    | OpSpec::CheckInCell { .. }
             )
         })
     {
@@ -1224,6 +1324,23 @@ fn lower(
     cur: &Snapshot,
     anchors: &[(u32, u32, u32)],
 ) -> Result<(Vec<Op>, Option<String>)> {
+    // **백엔드가 편집으로 받는 표인가.** 앵커는 백엔드의 표 목록이다.
+    //
+    // 증인은 중첩 표의 칸도 들고 있어서 우리 검사만으로는 통과한다. 그러면
+    // 저장에서 백엔드가 "최상위 표 N개; 중첩 표는 v1 범위 밖" 으로 거부하고,
+    // 그 전에 `dryRun` 은 통과해 버린다 — 부르는 쪽이 미리 가를 길이 없다.
+    let writable_table = |table: u32| -> Result<()> {
+        if anchors.is_empty() || anchors.iter().any(|(idx, _, _)| *idx == table) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "표{table} 는 쓸 수 없다 — 백엔드 편집은 최상위 표만 받는다(중첩 표는 범위 밖). \
+             `read: [\"tables\"]` 에 있는 표만 고칠 수 있고, `read: [\"checks\"]` 의 각 항목은 \
+             `writable` 로 그것을 말한다. 쓸 수 있는 표: {:?}",
+            anchors.iter().map(|(i, _, _)| *i).collect::<Vec<_>>()
+        )
+    };
+
     let text_at = |section: u32, para: u32| -> Result<&String> {
         cur.paras
             .get(&(section, para))
@@ -1236,6 +1353,7 @@ fn lower(
             (replace_para(*section, *para, text_at(*section, *para)?, text), None)
         }
         OpSpec::SetCell { table, row, col, text, lines } => {
+            writable_table(*table)?;
             if !cur.cells.contains_key(&(*table, *row, *col)) {
                 anyhow::bail!("없는 셀이다: 표{table} ({row},{col})");
             }
@@ -1279,6 +1397,7 @@ fn lower(
             (vec![Op::SetCell { table: *table, row: *row, col: *col, lines: want }], None)
         }
         OpSpec::InsertTextInCell { table, row, col, cell_para, offset, text } => {
+            writable_table(*table)?;
             // 줄바꿈을 먼저 본다. `reject_unwritable` 도 `\n` 을 막지만
             // "제어문자" 라고만 말하는데, 여기서 기계가 실제로 하려던 일은
             // **문단을 더 만드는 것**이므로 그쪽 길을 가리켜 주는 편이 낫다.
@@ -1308,6 +1427,7 @@ fn lower(
             )
         }
         OpSpec::DeleteTextInCell { table, row, col, cell_para, offset, count } => {
+            writable_table(*table)?;
             let n = cell_para_len(cur, *table, *row, *col, *cell_para)?;
             if offset + count > n {
                 anyhow::bail!(
@@ -1361,6 +1481,7 @@ fn lower(
             }
         }
         OpSpec::CheckInCell { table, row, col, cell_para, offset, checked } => {
+            writable_table(*table)?;
             let whole = cell_para_text(cur, *table, *row, *col, *cell_para)?;
             let (was, already) =
                 box_at(&whole, *offset, &format!("표{table} ({row},{col}) 문단{cell_para}"))?;
@@ -1930,7 +2051,7 @@ fn box_label(chars: &[char], from: usize) -> String {
 /// 사용자 보고(2026-10-29): 체크박스를 토글할 방법이 없었다. 먼저 **어디에
 /// 있는지** 를 줘야 한다 — 실측으로 본문 단락에 62개, 표 칸에 73개다. 칸만
 /// 다루면 절반을 놓친다.
-fn checks_json(path: &std::path::Path) -> Result<Vec<Value>> {
+fn checks_json(path: &std::path::Path, writable_tables: &BTreeSet<u32>) -> Result<Vec<Value>> {
     use hwp_core::offset;
 
     let t = Testimony::read(path)?;
@@ -1950,6 +2071,8 @@ fn checks_json(path: &std::path::Path) -> Result<Vec<Value>> {
                     "box": c.to_string(),
                     "checked": on,
                     "label": box_label(&chars, n),
+                    // 본문 단락은 표가 아니므로 늘 쓸 수 있다
+                    "writable": true,
                 }));
             }
         }
@@ -1960,7 +2083,21 @@ fn checks_json(path: &std::path::Path) -> Result<Vec<Value>> {
                 let chars: Vec<char> = para.chars().collect();
                 for (n, &c) in chars.iter().enumerate() {
                     if let Some(on) = box_state(c) {
-                        out.push(json!({
+                        // **쓸 수 있는 좌표인지 말해 준다.**
+                        //
+                        // 사용자 보고(hwp-vi#1): `checks` 가 돌려준 표 번호를
+                        // `tables` 도, 쓰기도 받지 못했다. 이 읽기는 **증인**을
+                        // 쓰는데 증인은 중첩 표도 세고, 백엔드의 편집은
+                        // **최상위 표만** 받는다("중첩 표는 v1 범위 밖").
+                        // 공공기관 양식은 바깥 표 안에 점검표를 넣는 구성이
+                        // 흔해서, 체크박스가 중첩 표 안에 있는 쪽이 오히려
+                        // 보통이다.
+                        //
+                        // 범위 밖인 것 자체는 백엔드의 사정이다. 문제는 그
+                        // 사실이 **읽기 쪽에 드러나지 않는** 것이었다 — 받는
+                        // 쪽이 미리 가를 길이 없었다.
+                        let writable = writable_tables.contains(&tb.index);
+                        let mut o = json!({
                             "kind": "cell",
                             "at": format!("{}:{}:{}", tb.index, cell.row, cell.col),
                             "table": tb.index,
@@ -1971,7 +2108,19 @@ fn checks_json(path: &std::path::Path) -> Result<Vec<Value>> {
                             "box": c.to_string(),
                             "checked": on,
                             "label": box_label(&chars, n),
-                        }));
+                            "writable": writable,
+                        });
+                        if !writable {
+                            if let Value::Object(m) = &mut o {
+                                m.insert(
+                                    "why".into(),
+                                    json!("중첩 표 안입니다 — 백엔드 편집은 최상위 표만 \
+                                           받습니다(`tables` 에 이 번호가 없습니다). \
+                                           사람 쪽 화면에서는 고칠 수 있습니다."),
+                                );
+                            }
+                        }
+                        out.push(o);
                     }
                 }
             }

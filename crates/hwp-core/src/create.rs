@@ -124,13 +124,39 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
     Ok(Wanted { lines, tables })
 }
 
-/// 명세를 읽어 **무엇이 만들어질지**만 말한다. 백엔드를 부르지 않는다.
+/// 미리보기 — **실제로 만들어 보고 버린다.**
 ///
-/// 미리보기가 디스크를 건드리지 않는다는 것은 이 입구의 약속이다 — 기계 쪽
-/// `output` 에서 그 약속이 깨져 남의 문서를 지운 적이 있어서(실측), 만들기
-/// 쪽은 처음부터 파일을 만들지 않는 길로 둔다.
-pub fn plan(spec: &Value) -> Result<Value> {
+/// 사용자 보고(hwp-vi#3): `dryRun` 이 통과시킨 요청이 저장에서 깨졌다.
+/// `{"version":"9.9"}` 이나 객체로 준 `font` 가 미리보기를 통과하고 백엔드의
+/// `scaffold` 에서 거부됐다. **미리보기의 쓸모가 "쓰기 전에 확인" 하나인데
+/// 그 확인을 지난 요청이 깨지면 장치가 비어 있는 것과 같다** — 부르는 쪽은
+/// 미리보기를 믿고 다음 단계를 짠다.
+///
+/// 전에는 일부러 백엔드를 부르지 않았다. 이유는 "미리보기가 디스크를 건드리지
+/// 않는다" 는 약속이었고(기계 쪽 `output` 에서 그 약속이 깨져 남의 문서를
+/// 지운 적이 있다), 그 약속은 **사용자가 준 경로**에 대한 것이다. 임시
+/// 디렉터리에 만들어 보고 지우는 것은 그 약속을 깨지 않으면서 명세를 실제로
+/// 검증한다.
+///
+/// 그래서 `create` 와 **같은 길**을 간다 — 자가검증까지. 통과한 미리보기는
+/// "이 명세로 저장하면 된다" 를 뜻하고, 그게 미리보기가 할 말이다.
+pub fn plan(rhwp: &Rhwp, spec: &Value) -> Result<Value> {
     let w = wanted_from(spec)?;
+    let dir = std::env::temp_dir().join(format!(
+        "hwp-create-plan-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("{} 를 만들 수 없습니다", dir.display()))?;
+    let probe = dir.join("probe.hwpx");
+    let report = create(rhwp, spec, &probe);
+    let _ = std::fs::remove_dir_all(&dir);
+    let report = report?;
+
     Ok(serde_json::json!({
         "blocks": w.lines.len() + w.tables.len(),
         "lines": w.lines,
@@ -139,6 +165,10 @@ pub fn plan(spec: &Value) -> Result<Value> {
             "cols": g.first().map(|r| r.len()).unwrap_or(0),
         })).collect::<Vec<_>>(),
         "title": spec.get("title").and_then(|t| t.as_str()),
+        // 미리보기가 **실제로 만들어 본** 결과다 — 숫자는 증인이 센 것이다.
+        "paragraphs": report.paragraphs,
+        "cells": report.cells,
+        "verifiedBy": "witness (임시본을 만들어 대조한 뒤 지웠습니다)",
     }))
 }
 

@@ -2070,7 +2070,23 @@ fn the_machine_entry_point_mixes_edit_kinds_and_saves_once() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("응답이 JSON 이어야 한다");
     assert_eq!(v["ok"], true, "{stdout}");
     assert_eq!(v["applied"].as_array().unwrap().len(), 3);
-    assert!(v["saved"]["backup"].is_string(), "백업을 남기지 않았다");
+    // **`output` 저장에는 백업이 없어야 한다.**
+    //
+    // 전에는 `.bak` 이 생겼고 이 시험이 그것을 **요구로 적어** 뒀다. 그런데
+    // 그 백업은 원본의 백업이 아니라 **방금 만든 사본의 백업**이었다 — 뜻이
+    // 없고, 목적지 옆에 1MB 쓰레기로 남았다(실측). 지금은 목적지 옆 임시본에
+    // 적용하고 통과할 때만 `rename` 하므로 백업할 대상이 없다. 제자리 저장의
+    // `.bak` 은 `saving_twice_keeps_the_original_backup` 이 지킨다.
+    assert!(
+        v["saved"]["backup"].is_null(),
+        "`output` 저장인데 백업을 만들었다: {stdout}"
+    );
+    assert_eq!(
+        v["saved"]["path"].as_str(),
+        Some(dest.display().to_string().as_str()),
+        "응답이 가리키는 경로가 목적지가 아니다 — 임시본을 가리키면 없는 파일이 된다"
+    );
+    assert!(!bak.exists(), "목적지 옆에 .bak 이 남았다: {}", bak.display());
 
     // 독립 증인으로 다시 읽는다 — 백엔드의 말을 그대로 믿지 않는다.
     let after = Testimony::read(&dest).expect("저장된 문서를 읽는다");
@@ -4095,6 +4111,144 @@ fn converting_between_formats_keeps_the_text_and_survives_a_round_trip() {
     let e = hwp_core::convert::convert(&rhwp, first, &dir.join("x.pdf"), true)
         .expect_err("`.pdf` 는 거부해야 한다");
     assert!(format!("{e:#}").contains("pdf"), "{e:#}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **실패한 요청은 `output` 을 남기지 않고, 거기 있던 문서도 건드리지 않는다.**
+///
+/// 사용자 보고(hwp-vi#2): 저장이 멈춘 요청(`ok: false`)인데 `output` 경로에
+/// **입력의 바이트 사본**이 남았다. 원본과 원자성은 지켜졌지만, 스크립트가
+/// `output` 의 존재나 mtime 으로 성공을 판단하는 것은 흔한 습관이고 그러면
+/// **아무것도 반영되지 않은 파일을 결과물로 집어 든다.** 조용히 틀리는 쪽이
+/// 제일 비싸다는 이 저장소의 기준에 그대로 걸린다.
+///
+/// 고치면서 **더 센 것**이 드러났다: `overwrite: true` 면 검증 **전에**
+/// 목적지가 입력 사본으로 덮였다. 연산이 실패하면 거기 있던 문서는 이미
+/// 사라진 뒤다 — 앞서 막은 쓰기 파괴 경로 네 개의 다섯 번째였고 그 목록에서
+/// 빠져 있었다. 그래서 목적지 **옆 임시본**에 적용하고 통과할 때만 `rename`
+/// 한다.
+#[test]
+fn a_failed_request_leaves_no_output_and_spares_what_was_there() {
+    let Some(((_, _), files)) = backend().zip(Some(samples())) else { return };
+    let Some(src) = files.iter().find(|f| {
+        Testimony::read(f).map(|t| !t.tables.is_empty()).unwrap_or(false)
+    }) else {
+        return;
+    };
+    let exe = workspace_root().join("target/release/hwp");
+    if !exe.is_file() {
+        return;
+    }
+    let ext = src.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-failout-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    // 반드시 실패하는 연산 — 없는 표
+    let ops = r#"[{"op":"set-cell","table":9999,"row":0,"col":0,"text":"x"}]"#;
+
+    // ---- 1) 목적지가 없을 때: 아무것도 생기지 않는다
+    let dest = dir.join(format!("out.{ext}"));
+    let req = format!(
+        r#"{{"file":"{}","output":"{}","ops":{ops}}}"#,
+        src.display(),
+        dest.display()
+    );
+    let out = std::process::Command::new(&exe)
+        .args(["api", "--compact", "-r", &req])
+        .output()
+        .expect("hwp api");
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("JSON");
+    assert_eq!(v["ok"], false, "이 요청은 실패해야 한다");
+    assert!(!dest.exists(), "실패했는데 {} 가 생겼다", dest.display());
+    // 임시본도 남지 않아야 한다
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(leftovers.is_empty(), "임시본이 남았다: {leftovers:?}");
+
+    // ---- 2) 목적지에 지켜야 할 파일이 있을 때: 손대지 않는다
+    let keep = dir.join(format!("keep.{ext}"));
+    std::fs::write(&keep, b"this must survive").expect("쓰기");
+    let before = std::fs::read(&keep).expect("읽기");
+    let req2 = format!(
+        r#"{{"file":"{}","output":"{}","overwrite":true,"ops":{ops}}}"#,
+        src.display(),
+        keep.display()
+    );
+    let out2 = std::process::Command::new(&exe)
+        .args(["api", "--compact", "-r", &req2])
+        .output()
+        .expect("hwp api");
+    let v2: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out2.stdout)).expect("JSON");
+    assert_eq!(v2["ok"], false, "이 요청도 실패해야 한다");
+    assert_eq!(
+        std::fs::read(&keep).expect("읽기"),
+        before,
+        "실패한 요청이 목적지에 있던 문서를 바꿨다"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **미리보기를 지난 만들기는 저장에서 깨지지 않아야 한다.**
+///
+/// 사용자 보고(hwp-vi#3): `dryRun` 이 통과시킨 `create` 가 저장에서 백엔드
+/// 파싱 오류로 멈췄다(`version: "9.9"`, 객체로 준 `font`). **미리보기의 쓸모가
+/// "쓰기 전에 확인" 하나인데 그 확인을 지난 요청이 깨지면 장치가 비어 있는
+/// 것과 같다.** 지금은 미리보기도 임시 디렉터리에 실제로 만들어 보고 버린다.
+#[test]
+fn a_create_preview_that_passes_means_the_save_will_pass() {
+    if backend().is_none() {
+        return;
+    }
+    let exe = workspace_root().join("target/release/hwp");
+    if !exe.is_file() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-plan-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let dest = dir.join("made.hwpx");
+
+    let run = |spec: &str, dry: bool| -> serde_json::Value {
+        let req = format!(
+            r#"{{"create":{spec},"output":"{}"{}}}"#,
+            dest.display(),
+            if dry { r#","dryRun":true"# } else { "" }
+        );
+        let out = std::process::Command::new(&exe)
+            .args(["api", "--compact", "-r", &req])
+            .output()
+            .expect("hwp api");
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("JSON")
+    };
+
+    // **깨지는 명세는 미리보기에서 멈춘다.**
+    let bad = r#"{"version":"9.9","title":"t","blocks":[{"type":"paragraph","text":"가"}]}"#;
+    assert_eq!(run(bad, true)["ok"], false, "모르는 스키마 버전이 미리보기를 통과했다");
+    // `font` 는 **문자열**이다 — 객체를 주면 백엔드가 거부한다
+    let bad2 = r#"{"version":"1","title":"t","font":{"name":"x","size_pt":13},
+                   "blocks":[{"type":"paragraph","text":"가"}]}"#;
+    assert_eq!(run(bad2, true)["ok"], false, "객체로 준 font 가 미리보기를 통과했다");
+
+    // **미리보기는 사용자가 준 경로를 건드리지 않는다.**
+    assert!(!dest.exists(), "미리보기가 목적지를 만들었다");
+
+    // **통과한 미리보기는 저장도 통과한다.**
+    let good = r#"{"version":"1","title":"t","font":"함초롬바탕",
+                   "blocks":[{"type":"paragraph","text":"가"}]}"#;
+    let plan = run(good, true);
+    assert_eq!(plan["ok"], true, "{plan}");
+    assert!(!dest.exists(), "미리보기가 목적지를 만들었다");
+    let made = run(good, false);
+    assert_eq!(made["ok"], true, "미리보기를 지났는데 저장이 깨졌다: {made}");
+    assert!(dest.exists(), "저장했는데 파일이 없다");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
