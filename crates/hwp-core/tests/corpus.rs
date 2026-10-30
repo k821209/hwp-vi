@@ -48,6 +48,7 @@ fn corpus_is_synthetic() -> bool {
 const REAL_CORPUS_ONLY: &[&str] = &[
     "a_drawn_table_keeps_the_column_proportions_of_the_document",
     "character_decoration_agrees_across_the_two_formats",
+    "the_two_formats_read_the_same_text_including_forced_line_breaks",
     "column_width_is_measured_for_real_documents",
     "decoration_runs_stay_inside_their_paragraph",
     "deleting_a_paragraph_that_holds_a_drawing_is_refused_before_anything_is_written",
@@ -3921,6 +3922,102 @@ fn a_paragraph_that_holds_a_drawing_still_refuses_but_names_the_way_out() {
     assert!(
         msg.contains("delete-table") && msg.contains("delete-control"),
         "거부만 하고 갈 곳을 말하지 않는다: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **두 포맷이 같은 글자를 읽어야 한다 — 강제 줄바꿈까지.**
+///
+/// 사용자가 "hwp→hwpx 변환 기능이 있나" 고 물어서 변환 충실도를 재다가 결함이
+/// 드러났다. HWPX 를 HWP 로 바꿔 두 쪽을 읽으니 **본문이 다르게 읽혔고**,
+/// 변환이 범인인 줄 알았다. 아니었다 — 우리 HWP5 판독기가 단독 컨트롤 10
+/// (강제 줄바꿈)을 버리고 있었고, OWPML 쪽은 `hp:lineBreak` 를 `'\n'` 으로
+/// 읽고 있었다. **같은 개념을 두 판독기가 다르게 읽은 것**이다.
+///
+/// 글자 하나로 끝나지 않는다. 백엔드의 `--offset` 은 그 글자를 **센다**(실측
+/// 확인: 줄바꿈이 64번째인 단락의 65번째에 넣으면 줄바꿈 바로 뒤에 들어간다).
+/// 그래서 버리는 동안 강제 줄바꿈이 있는 `.hwp` 의 모든 오프셋이 하나씩
+/// 짧았다. **자가검증은 이걸 못 잡는다** — 기대값과 재생이 같은 틀린 오프셋을
+/// 쓰므로 둘이 일치해 통과한다(접힌 줄 결함과 같은 종류).
+///
+/// 이 시험이 **실무 문서를 요구하는 이유**: 합성 코퍼스에는 강제 줄바꿈이
+/// 없다. 백엔드의 `insert-text --text` 가 줄바꿈을 거부하므로 우리 생성기로는
+/// 만들 수가 없다. 그래서 `REAL_CORPUS_ONLY` 이고, **줄바꿈을 하나도 못 봤으면
+/// 실패한다** — 조용히 통과하는 쪽이 더 나쁘다.
+#[test]
+fn the_two_formats_read_the_same_text_including_forced_line_breaks() {
+    if !needs_real_corpus("the_two_formats_read_the_same_text_including_forced_line_breaks") {
+        return;
+    }
+    let Some((rhwp, _)) = backend() else { return };
+    let files: Vec<PathBuf> = samples()
+        .into_iter()
+        .filter(|f| f.extension().and_then(|s| s.to_str()) == Some("hwpx"))
+        .collect();
+    if files.is_empty() {
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-xfmt-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    // **보이는 글자로 비교한다** (`offset::visible`).
+    //
+    // 날 글자로 비교하면 실패하는데 그건 손실이 아니다 — 두 포맷은 개체 자리
+    // 표시의 수가 다르다(p.hwpx 단락0: HWP5 쪽에 U+FFFC 3개가 더 있다. 구역
+    // 정의·쪽번호 같은 확장 컨트롤이고 OWPML 은 본문 글자로 내지 않는다).
+    // `offset::visible` 은 편집 오프셋과 기계 출력이 **함께 쓰는** 정의이므로
+    // 여기서 비교해야 할 단위도 그것이다.
+    let text_of = |path: &std::path::Path| -> BTreeMap<(u32, u32), String> {
+        Testimony::read(path)
+            .expect("증인")
+            .body_paragraphs()
+            .into_iter()
+            .filter_map(|p| p.index.map(|i| ((p.section, i), hwp_core::offset::visible(&p.text))))
+            .collect()
+    };
+
+    let mut breaks_seen = 0usize;
+    let mut checked = 0usize;
+    for src in &files {
+        let out = dir.join(format!(
+            "{}.hwp",
+            src.file_stem().and_then(|s| s.to_str()).unwrap_or("x")
+        ));
+        // 백엔드의 `--verify` 는 **작성자가 자기 답을 채점하는 것**이므로 통과
+        // 여부만 보고, 내용 대조는 우리 증인이 한다.
+        let (sp, op) = (src.display().to_string(), out.display().to_string());
+        let ok = rhwp.run(&["convert", &sp, &op, "--verify"]).is_ok();
+        if !ok || !out.is_file() {
+            continue;
+        }
+        let a = text_of(src);
+        let b = text_of(&out);
+        breaks_seen += a.values().filter(|s| s.contains('\n')).count();
+        checked += 1;
+        for (k, want) in &a {
+            let got = b.get(k);
+            assert_eq!(
+                got,
+                Some(want),
+                "{} 의 구역{} 단락{} 이 포맷에 따라 다르게 읽힌다\n  hwpx: {want:?}\n  hwp : {:?}",
+                src.display(),
+                k.0,
+                k.1,
+                got
+            );
+        }
+        assert_eq!(a.len(), b.len(), "{} 의 단락 수가 변환 뒤 달라졌다", src.display());
+    }
+
+    assert!(checked > 0, "변환에 성공한 문서가 없다 — 이 시험이 아무것도 보지 않았다");
+    // **본 것이 있는지 확인한다.** 강제 줄바꿈이 없는 문서만 봤다면 이 시험은
+    // 통과해도 뜻이 없다 — 고치기 전에도 통과했을 것이다(실제로 그랬다).
+    assert!(
+        breaks_seen > 0,
+        "강제 줄바꿈이 있는 단락을 하나도 못 봤다 — 이 시험이 지키려는 글자가 \
+         코퍼스에 없다. 그 글자가 있는 문서를 넣거나, 이 시험을 지워라"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
