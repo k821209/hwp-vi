@@ -67,6 +67,16 @@ pub struct Request {
     /// 대조하고, 다르면 파일을 남기지 않는다.
     #[serde(default)]
     pub create: Option<serde_json::Value>,
+    /// **포맷을 바꾼다** — `file` 을 `output` 의 확장자로.
+    ///
+    /// `.hwp` ↔ `.hwpx`. 증인이 원본과 산출물의 글자·글자별 꾸밈·표 칸·표
+    /// 꼴·그림 자리를 대조하고 같을 때만 파일을 남긴다. 백엔드의 `--verify` 는
+    /// 자기 산출물을 자기가 다시 파싱하는 것이라 그것만으로는 믿지 않는다.
+    ///
+    /// 보통 `output` 은 원본과 **같은 확장자**를 요구한다(조용한 변환을 막으려고).
+    /// 이 칸이 참일 때만 그 요구를 푼다 — 바꾸겠다고 말한 것이니까.
+    #[serde(default)]
+    pub convert: bool,
     /// 원본을 덮지 않고 이 파일로 쓴다
     #[serde(default)]
     pub output: Option<PathBuf>,
@@ -320,6 +330,12 @@ pub const CAPS: &[Cap] = &[
         id: "delete-text-in-cell",
         what: "표 칸 안의 한 문단에서 글자를 지운다 — 좌표는 `insert-text-in-cell` 과 같다",
         machine: Machine::Op("delete-text-in-cell"),
+        ex: &[],
+    },
+    Cap {
+        id: "convert",
+        what: "포맷을 바꾼다 (.hwp ↔ .hwpx) — 증인이 대조한 뒤에만 파일을 남긴다",
+        machine: Machine::Field("convert"),
         ex: &[],
     },
     Cap {
@@ -692,6 +708,54 @@ pub fn run(req: Request) -> Result<Value> {
         if req.file.is_none() {
             return Ok(Value::Object(out));
         }
+    }
+
+    // **변환은 따로 간다.** 읽기·편집과 섞으면 어느 파일을 두고 하는 말인지
+    // 흐려진다 — 원본을 읽고 다른 파일을 내놓는 연산이다.
+    if req.convert {
+        let Some(src) = req.file.clone() else {
+            anyhow::bail!("변환에는 `file` 이 필요하다 — 바꿀 문서를 줘라.");
+        };
+        let Some(dest) = req.output.clone() else {
+            anyhow::bail!(
+                "변환에는 `output` 이 필요하다 — 만들 파일 경로를 줘라. \
+                 방향은 그 확장자가 정한다 (`.hwp` 또는 `.hwpx`)."
+            );
+        };
+        if !req.ops.is_empty() || !req.read.is_empty() || req.create.is_some() {
+            anyhow::bail!(
+                "`convert` 는 혼자 보내라 — `ops`·`read`·`create` 와 섞으면 어느 \
+                 파일을 두고 하는 말인지 흐려진다. 바꾼 뒤 그 파일로 다시 요청해라."
+            );
+        }
+        if req.dry_run {
+            let plan = hwp_core::convert::plan(&src, &dest)?;
+            out.insert("output".into(), json!(dest.display().to_string()));
+            out.insert("outputWritten".into(), json!(false));
+            out.insert("dryRun".into(), json!(true));
+            out.insert("willConvert".into(), plan);
+            return Ok(Value::Object(out));
+        }
+        let pin = Pin::load_default()?;
+        let rhwp = Rhwp::discover(&pin)?;
+        let r = hwp_core::convert::convert(&rhwp, &src, &dest, req.overwrite)?;
+        out.insert("output".into(), json!(dest.display().to_string()));
+        out.insert(
+            "converted".into(),
+            json!({
+                "to": r.to,
+                "paragraphs": r.paragraphs,
+                "cells": r.cells,
+                "images": r.images,
+                "verifiedBy": "witness",
+            }),
+        );
+        // **막지 않은 차이도 응답에 싣는다.** 사람 쪽은 `⚠` 로 보는데 기계가
+        // 못 받으면 같은 기능이 아니다.
+        if !r.warnings.is_empty() {
+            out.insert("warnings".into(), json!(r.warnings));
+        }
+        return Ok(Value::Object(out));
     }
 
     // **만들기는 `file` 이 없다.** 고칠 문서가 아니라 만들 명세를 받는다.

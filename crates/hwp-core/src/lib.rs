@@ -20,6 +20,7 @@ pub mod offset;
 pub mod outline;
 pub mod pin;
 pub mod create;
+pub mod convert;
 pub mod text;
 pub mod wrap;
 pub mod rhwp;

@@ -4023,6 +4023,82 @@ fn the_two_formats_read_the_same_text_including_forced_line_breaks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **포맷을 바꿔도 글자가 그대로여야 한다 — 왕복까지.**
+///
+/// 사용자 요청(2026-10-30): 변환을 내놓되 "백엔드 호출만 감싸는 게 아니라
+/// 증인으로 양쪽을 대조해서 통과할 때만 파일을 남기는" 모양으로.
+///
+/// 백엔드의 `--verify` 는 **자기 산출물을 자기가 다시 파싱하는 것**이라
+/// (`scaffold` 때와 같은 이유) 그것만으로는 믿지 않는다. 이 시험은 그 대조가
+/// 실제로 돌아가는지, 그리고 **왕복했을 때 처음으로 돌아오는지**를 본다.
+#[test]
+fn converting_between_formats_keeps_the_text_and_survives_a_round_trip() {
+    let Some(((rhwp, _), files)) = backend().zip(Some(samples())) else { return };
+    if files.is_empty() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-conv-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    let seen = |path: &std::path::Path| -> (Vec<String>, Vec<String>) {
+        let t = Testimony::read(path).expect("증인");
+        (
+            t.body_paragraphs()
+                .into_iter()
+                .filter(|p| p.index.is_some())
+                .map(|p| hwp_core::offset::visible(&p.text))
+                .collect(),
+            t.tables
+                .iter()
+                .flat_map(|tb| tb.cells.iter().map(|c| c.text.clone()))
+                .collect(),
+        )
+    };
+
+    let mut rounds = 0usize;
+    for src in &files {
+        let Some(ext) = src.extension().and_then(|s| s.to_str()) else { continue };
+        let (other, back) = match ext {
+            "hwp" => ("hwpx", "hwp"),
+            "hwpx" => ("hwp", "hwpx"),
+            _ => continue,
+        };
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("x");
+        let mid = dir.join(format!("{stem}.{other}"));
+        let end = dir.join(format!("{stem}-back.{back}"));
+
+        // 한 번 바꾼다 — 대조를 통과하지 못하면 여기서 Err 다
+        let r1 = hwp_core::convert::convert(&rhwp, src, &mid, true)
+            .unwrap_or_else(|e| panic!("{} → .{other}: {e:#}", src.display()));
+        let want = seen(src);
+        assert_eq!(r1.paragraphs, want.0.len(), "보고한 단락 수가 증인과 다르다");
+        assert_eq!(r1.cells, want.1.len(), "보고한 칸 수가 증인과 다르다");
+
+        // **되돌려 처음으로 오는가.** 한 방향만 보면 두 번 틀려 같아지는 길을
+        // 못 본다 — 왕복은 그걸 본다.
+        hwp_core::convert::convert(&rhwp, &mid, &end, true)
+            .unwrap_or_else(|e| panic!("{} → .{back}: {e:#}", mid.display()));
+        let got = seen(&end);
+        assert_eq!(got.0, want.0, "{} 왕복 뒤 본문이 달라졌다", src.display());
+        assert_eq!(got.1, want.1, "{} 왕복 뒤 표 칸이 달라졌다", src.display());
+        rounds += 1;
+    }
+    assert!(rounds > 0, "왕복한 문서가 없다 — 이 시험이 아무것도 보지 않았다");
+
+    // **같은 파일로는 바꾸지 않는다.**
+    let first = files.iter().find(|f| f.extension().is_some()).expect("문서");
+    let e = hwp_core::convert::convert(&rhwp, first, first, true)
+        .expect_err("원본과 목적지가 같으면 거부해야 한다");
+    assert!(format!("{e:#}").contains("같은 파일"), "{e:#}");
+
+    // **받지 않는 확장자는 백엔드를 부르기 전에 거부한다.**
+    let e = hwp_core::convert::convert(&rhwp, first, &dir.join("x.pdf"), true)
+        .expect_err("`.pdf` 는 거부해야 한다");
+    assert!(format!("{e:#}").contains("pdf"), "{e:#}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// **코퍼스는 무엇을 못 재는지 스스로 말해야 한다.**
 ///
 /// 이 저장소의 1번 재발 패턴은 "시험을 깔끔하게 하려고 걸러낸 것이 결함이 사는

@@ -672,7 +672,25 @@ fn tables_from_records(
     let records = collect_records(buf);
     let mut out: Vec<WitnessTable> = Vec::new();
 
-    for (i, (tag, _lvl, payload)) in records.iter().enumerate() {
+    // 표마다 그 `TABLE` 레코드의 중첩 수준. **칸은 표보다 정확히 한 단계
+    // 아래의 `LIST_HEADER` 다.**
+    //
+    // 수준을 안 보면 **칸 안 글상자의 글자 목록이 칸으로 잡힌다.** 실측
+    // (s14 를 변환한 .hwp 표17): 진짜 칸은 수준 2 의 `LIST_HEADER` 인데,
+    // 글상자 안의 목록이 수준 6 에 또 있고 거기도 `(행 0, 열 0)` 이라 1×1
+    // 표의 좌표 검사를 통과해 **칸을 `③` 으로 덮었다.**
+    // `(out 안의 색인, 그 TABLE 레코드의 수준)` 을 **스택**으로 든다.
+    //
+    // 실측(s00.hwp): `TABLE` 과 그 칸들의 `LIST_HEADER` 는 **같은 수준**이다
+    // (둘 다 2). 한 단계 아래일 거라 짐작했다가 시험 넷을 깼다 — `PARA_HEADER`
+    // 가 `LIST_HEADER` 와 형제인 것과 같은 꼴이다. 이 포맷은 "담는 것" 과
+    // "담기는 것" 을 수준으로 가르지 않는 자리가 있다.
+    //
+    // `last()` 만으로는 안 된다 — 중첩 표가 끝난 뒤 **바깥 표의 칸이 또
+    // 나온다.** 그때 마지막 표는 중첩된 쪽이라 그 칸들이 버려진다.
+    let mut stack: Vec<(usize, u16)> = Vec::new();
+
+    for (i, (tag, lvl, payload)) in records.iter().enumerate() {
         match *tag {
             HWPTAG_TABLE => {
                 if payload.len() < 8 {
@@ -686,10 +704,28 @@ fn tables_from_records(
                     cols,
                     cells: Vec::new(),
                 });
+                // 이 수준 이상으로 열려 있던 표는 끝났다
+                while stack.last().is_some_and(|(_, l)| *l >= *lvl) {
+                    stack.pop();
+                }
+                stack.push((out.len() - 1, *lvl));
                 *next_index += 1;
             }
             HWPTAG_LIST_HEADER => {
-                let Some(table) = out.last_mut() else { continue };
+                // **표보다 한 단계 아래가 아니면 이 표의 칸이 아니다.**
+                // 같은 수준에 열려 있는 가장 안쪽 표의 칸이다. 그런 표가
+                // 없으면 이건 표의 칸이 아니라 **다른 것**(글상자 안의 글자
+                // 목록 등)이다 — 실측: s14 의 글상자 목록이 수준 6 에 있는데
+                // 그 수준에 열린 표가 없다.
+                let Some(parent) = stack
+                    .iter()
+                    .rev()
+                    .find(|(_, l)| l == lvl)
+                    .map(|(idx, _)| *idx)
+                else {
+                    continue;
+                };
+                let Some(table) = out.get_mut(parent) else { continue };
                 if payload.len() < 16 {
                     continue;
                 }
@@ -730,9 +766,35 @@ fn tables_from_records(
                     .max(0) as usize;
                 let mut parts: Vec<String> = Vec::new();
                 let mut align = ParaAlign::default();
-                for (tag2, _, pl2) in &records[i + 1..] {
+                // **칸보다 깊은 레코드는 칸의 글자가 아니다.**
+                //
+                // 레코드 헤더에 중첩 수준이 있는데 이 루프가 `_` 로 버리고
+                // 있었다. 그래서 칸 안에 **글상자**가 있으면 그 안의 단락
+                // 글자가 칸으로 끌려 들어왔다 — 실측: s14 를 변환한 .hwp 의
+                // 표17 (0,0) 이 `③` 으로 읽혔다(백엔드와 우리 OWPML 판독기는
+                // 둘 다 빈 칸이라고 한다).
+                //
+                // 보기가 이상한 데서 끝나지 않는다. `edit::snapshot` 이 이
+                // 값을 쓰므로 그런 칸은 `set-cell` 의 기대값이 영원히 어긋나
+                // **저장이 되지 않는다.**
+                let cell_level = records[i].1;
+                // 실측한 수준(s00.hwp 표0): `LIST_HEADER` 와 칸의 `PARA_HEADER`
+                // 가 **같은 수준**이고 `PARA_TEXT` 가 한 단계 아래다.
+                //
+                //     LIST_HEADER   level 2   ← 칸
+                //     PARA_HEADER   level 2   ← 칸의 단락 (형제다!)
+                //     PARA_TEXT     level 3
+                //
+                // 칸 안 글상자는 그 아래로 한 벌 더 들어간다(CTRL_HEADER →
+                // SHAPE_COMPONENT → LIST_HEADER level 4 → PARA_HEADER level 4 →
+                // PARA_TEXT level 5). 그래서 `cell_level + 1` 보다 깊은 것을
+                // 건너뛰면 개체 안의 글자가 칸으로 들어오지 않는다.
+                for (tag2, lvl2, pl2) in &records[i + 1..] {
+                    if *lvl2 > cell_level + 1 {
+                        continue;
+                    }
                     match *tag2 {
-                        HWPTAG_PARA_HEADER => {
+                        HWPTAG_PARA_HEADER if *lvl2 == cell_level => {
                             if parts.len() >= n_para {
                                 break;
                             }
@@ -745,7 +807,7 @@ fn tables_from_records(
                             }
                             parts.push(String::new());
                         }
-                        HWPTAG_PARA_TEXT => {
+                        HWPTAG_PARA_TEXT if *lvl2 == cell_level + 1 => {
                             let text = decode_para_text(pl2);
                             if let Some(last) = parts.last_mut() {
                                 *last = text;
@@ -755,15 +817,15 @@ fn tables_from_records(
                         _ => {}
                     }
                 }
-                // 백엔드는 셀 앞뒤의 빈 단락을 떼고 가운데 것은 남긴다. 맞춘다.
-                // 인라인 컨트롤도 빼는데, 그건 글자가 아니고 `--offset` 도 세지
-                // 않기 때문이다(`crate::offset`). 셀 글자만 비교 대상이다.
-                let text: String = parts
-                    .join("\n")
-                    .trim_matches('\n')
-                    .chars()
-                    .filter(|c| *c != crate::offset::CONTROL)
-                    .collect();
+                // 떼고 잇는 규칙은 `join_cell_paragraphs` 하나에 있다 — OWPML
+                // 쪽도 같은 함수를 쓴다. 인라인 컨트롤은 빼는데, 그건 글자가
+                // 아니고 `--offset` 도 세지 않기 때문이다(`crate::offset`).
+                let text: String = join_cell_paragraphs(
+                    parts
+                        .into_iter()
+                        .map(|s| s.chars().filter(|c| *c != crate::offset::CONTROL).collect())
+                        .collect(),
+                );
                 table.cells.push(WitnessCell {
                     row,
                     col,
@@ -1062,8 +1124,12 @@ fn decode_para_text(payload: &[u8]) -> String {
 /// [`decode_para_text`] 와 **같은 걸음**으로 걸으며 보이는 글자마다 원시 wchar
 /// 위치를 적는다. 꾸밈 구간을 보이는 글자 기준으로 옮기는 데 쓴다.
 ///
-/// 두 함수가 갈라지면 구간이 엉뚱한 글자에 붙는다. 그래서 코퍼스 시험이 둘의
-/// 글자 수가 같은지 본다.
+/// 두 함수가 갈라지면 구간이 엉뚱한 글자에 붙는다. **실제로 갈라졌다** —
+/// 컨트롤 10 을 `decode_para_text` 에만 글자로 더했더니 줄바꿈 뒤의 구간이 한
+/// 칸씩 밀렸다. 글자 수를 보는 코퍼스 시험이 있었지만 **코퍼스의 `.hwp` 에
+/// 강제 줄바꿈이 없어서** 못 봤고, 포맷 간 대조(`convert`)가 잡았다.
+///
+/// 글자로 세는 컨트롤을 더할 때는 **두 함수를 같이** 고칠 것.
 fn raw_positions(payload: &[u8]) -> Vec<usize> {
     const EXTENDED: [u16; 13] = [1, 2, 3, 11, 12, 14, 15, 16, 17, 18, 21, 22, 23];
     const INLINE: [u16; 8] = [4, 5, 6, 7, 8, 9, 19, 20];
@@ -1082,7 +1148,13 @@ fn raw_positions(payload: &[u8]) -> Vec<usize> {
             }
             raw += 8;
             i += 16;
-        } else if c == 30 || c == 31 {
+        } else if c == 10 || c == 30 || c == 31 {
+            // **10(강제 줄바꿈)·30·31(고정폭·묶음 빈칸)은 글자다.**
+            //
+            // 10 을 여기 넣지 않아 실제로 갈라졌다: `decode_para_text` 에만
+            // 넣었더니 줄바꿈 뒤의 꾸밈 구간이 **한 칸씩 밀렸다**(s04: HWPX 가
+            // 119번째 `‘` 에 주는 꾸밈을 HWP5 는 118번째 공백에 줬다). 위
+            // 주석이 경고하는 바로 그것이고, 포맷 간 대조가 잡았다.
             out.push(raw);
             raw += 1;
             i += 2;
@@ -1466,6 +1538,33 @@ fn paras_from_owpml(
 
 /// OWPML 에서 표와 셀을 읽는다.
 ///
+/// 칸 안 단락 목록 → 칸 글자. **두 판독기가 같은 이 함수를 쓴다.**
+///
+/// 규칙: **앞뒤의 빈 단락을 떼고**(백엔드가 그렇게 한다) 나머지를 `\n` 으로
+/// 잇는다. 가운데 빈 단락은 남긴다 — 서식의 빈 줄이다.
+///
+/// **떼는 단위가 단락이지 글자가 아니다.** 전에는 HWP5 쪽이 이은 문자열에
+/// `trim_matches('\n')` 를 걸었는데, 단독 컨트롤 10(강제 줄바꿈)을 `'\n'` 으로
+/// 읽게 된 뒤로는 그 방식이 **칸 끝의 진짜 줄바꿈까지 먹는다.**
+///
+/// 그리고 OWPML 쪽에는 이 떼기가 **아예 없었다** — 그래서 `.hwp` 를 `.hwpx` 로
+/// 바꾸면 같은 칸이 다르게 읽혔다(꼬리에 `\n` 하나). 백엔드는 양쪽을 531자로
+/// 같게 보는데 우리만 달랐다. 두 판독기가 같은 개념을 다르게 읽은 네 번째
+/// 자리다(U+2007, 강제 줄바꿈, 칸 떼기…).
+/// 칸 안 단락 경계를 모으는 동안 쓰는 표식. 문서 글자에는 나올 수 없다
+/// (HWP5 는 컨트롤 0 을 버리고 XML 에는 NUL 을 담을 수 없다).
+const CELL_PARA_MARK: char = '\u{0}';
+
+pub(crate) fn join_cell_paragraphs(mut parts: Vec<String>) -> String {
+    while parts.first().is_some_and(|p| p.is_empty()) {
+        parts.remove(0);
+    }
+    while parts.last().is_some_and(|p| p.is_empty()) {
+        parts.pop();
+    }
+    parts.join("\n")
+}
+
 /// `hp:tbl` 에 `rowCnt`/`colCnt`, 셀마다 `hp:cellAddr`(colAddr/rowAddr)·
 /// `hp:cellSpan`(colSpan/rowSpan)·`hp:subList`(본문)이 있다. 중첩 표도 있으므로
 /// 스택으로 센다.
@@ -1495,10 +1594,26 @@ fn tables_from_owpml(
     // 열려 있는 셀 (표 색인, 셀 색인)
     let mut cell: Option<(usize, usize)> = None;
     let mut text_depth = 0usize;
+    // **칸 안의 그리기개체 깊이.** 0 보다 크면 글자를 칸에 담지 않는다.
+    //
+    // `hp:tc` 안에 글상자가 있으면 그 안의 글자는 **칸의 글자가 아니다.**
+    // 전에는 `hp:tc` 안의 모든 `hp:t` 를 담아서 글상자 글자를 칸으로 끌어왔다
+    // (실측: s14.hwpx 표16 의 1×1 칸이 `①⏎②` 로 읽혔다. 백엔드와 우리 HWP5
+    // 판독기는 둘 다 빈 칸이라고 한다 — OWPML 쪽만 틀렸다).
+    //
+    // 그냥 보기가 이상해지는 데서 끝나지 않는다. `edit::snapshot` 이 이 값을
+    // 쓰므로, 그런 칸에 `set-cell` 을 하면 기대값과 되읽은 값이 영원히 어긋나
+    // **저장이 되지 않는다.**
+    let mut draw_depth = 0usize;
 
     loop {
         match reader.read_event().context("OWPML 표 파싱 실패")? {
             Event::Start(e) => match e.name().as_ref() {
+                // 그리기개체가 열렸다 — 닫히기 전의 글자는 칸의 것이 아니다
+                "hp:container" | "hp:drawText" | "hp:rect" | "hp:ellipse" | "hp:line"
+                | "hp:polygon" | "hp:curve" | "hp:connectLine" | "hp:pic" => {
+                    draw_depth += 1;
+                }
                 "hp:tbl" => {
                     out.push(WitnessTable {
                         index: *next_index,
@@ -1528,7 +1643,9 @@ fn tables_from_owpml(
                 "hp:t" => text_depth += 1,
                 // 셀 안의 둘째 단락부터는 줄바꿈으로 잇는다 (rhwp 와 같은 규칙)
                 "hp:p" => {
-                    if let Some((t, c)) = cell {
+                    // 그리기개체 안의 단락은 칸의 단락이 아니다 — 경계도 적지
+                    // 않는다. 적으면 칸에 없는 빈 단락이 생긴다.
+                    if let Some((t, c)) = cell.filter(|_| draw_depth == 0) {
                         // 셀 **첫 단락**의 정렬만 쓴다
                         if out[t].cells[c].text.is_empty() {
                             if let Some(a) = e
@@ -1540,7 +1657,13 @@ fn tables_from_owpml(
                                 out[t].cells[c].align = a.align;
                             }
                         } else {
-                            out[t].cells[c].text.push('\n');
+                            // **단락 경계를 `\n` 이 아니라 표식으로 둔다.**
+                            // `\n` 은 이제 글자이기도 하다(`hp:lineBreak`,
+                            // 강제 줄바꿈). 같은 글자로 적으면 `hp:tc` 가
+                            // 끝날 때 앞뒤 빈 단락을 뗄 수가 없다 — 칸 끝의
+                            // 진짜 줄바꿈까지 먹는다. 표식은 `hp:tc` 끝에서
+                            // `\n` 으로 바뀐다.
+                            out[t].cells[c].text.push(CELL_PARA_MARK);
                         }
                     }
                 }
@@ -1576,16 +1699,30 @@ fn tables_from_owpml(
                 }
             },
             Event::End(e) => match e.name().as_ref() {
+                "hp:container" | "hp:drawText" | "hp:rect" | "hp:ellipse" | "hp:line"
+                | "hp:polygon" | "hp:curve" | "hp:connectLine" | "hp:pic" => {
+                    draw_depth = draw_depth.saturating_sub(1);
+                }
                 "hp:tbl" => {
                     open.pop();
                     cell = None;
                 }
-                "hp:tc" => cell = None,
+                "hp:tc" => {
+                    // 칸이 끝났다 — 단락 표식을 풀어 **HWP5 쪽과 같은 규칙으로**
+                    // 잇는다.
+                    if let Some((ti, ci)) = cell {
+                        let raw = std::mem::take(&mut out[ti].cells[ci].text);
+                        out[ti].cells[ci].text = join_cell_paragraphs(
+                            raw.split(CELL_PARA_MARK).map(String::from).collect(),
+                        );
+                    }
+                    cell = None;
+                }
                 "hp:t" => text_depth = text_depth.saturating_sub(1),
                 _ => {}
             },
             Event::Text(t) => {
-                if text_depth > 0 {
+                if text_depth > 0 && draw_depth == 0 {
                     if let Some((ti, ci)) = cell {
                         let raw = t.xml10_content();
                         let text = unescape(&raw).context("셀 텍스트 unescape 실패")?;
@@ -1594,7 +1731,7 @@ fn tables_from_owpml(
                 }
             }
             Event::GeneralRef(r) => {
-                if text_depth > 0 {
+                if text_depth > 0 && draw_depth == 0 {
                     if let Some((ti, ci)) = cell {
                         if let Some(c) = resolve_entity(&r) {
                             out[ti].cells[ci].text.push_str(&c);

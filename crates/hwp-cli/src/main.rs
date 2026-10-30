@@ -173,6 +173,24 @@ enum Cmd {
         #[arg(long)]
         compact: bool,
     },
+    /// 포맷을 바꾼다 — `.hwp` ↔ `.hwpx`, **증인이 대조한 뒤에만** 파일을 남긴다
+    ///
+    /// 방향은 목적지 확장자가 정한다. 백엔드의 `--verify` 는 자기 산출물을
+    /// 자기가 다시 파싱하는 것이라, 우리 독립 판독기로 원본과 산출물의 글자·
+    /// 꾸밈·표 칸·그림 자리를 대조하고 같을 때만 자리에 놓는다.
+    #[command(hide = true)]
+    Convert {
+        /// 원본 (`.hwp` 또는 `.hwpx`)
+        file: PathBuf,
+        /// 만들 파일. 확장자가 방향을 정한다
+        dest: PathBuf,
+        /// 있는 파일을 덮는다
+        #[arg(long)]
+        overwrite: bool,
+        /// 바꾸지 않고 무엇을 할지만 말한다
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// 표 셀에 값을 기록한다 (서식 채우기 — 비대화형, 자가검증 저장)
     ///
     /// 기본 목록에서는 숨긴다 — 사람이 외울 명령은 `view`·`edit` 둘이다.
@@ -325,6 +343,9 @@ fn main() -> Result<()> {
         Cmd::Toc { file } => toc(&file),
         Cmd::Json { file, profile, compact } => json(&file, &profile, compact),
         Cmd::Edit { file, dubeolsik } => edit(&file, dubeolsik, None, None),
+        Cmd::Convert { file, dest, overwrite, dry_run } => {
+            convert_cmd(&file, &dest, overwrite, dry_run)
+        }
         Cmd::SetCell { file, assignments, output } => set_cell(&file, &assignments, output),
         Cmd::Cells { file, table } => cells(&file, table),
         Cmd::SetPara { file, assignments, output } => set_para(&file, &assignments, output),
@@ -568,6 +589,35 @@ fn parse_assignment(spec: &str) -> Result<hwp_core::edit::Op> {
         // `\n` 을 문단 경계로 받는다 — 셸에서 `$'가\n나'` 로 줄 수 있다.
         lines: text.split('\n').map(String::from).collect(),
     })
+}
+
+/// `hwp convert` — 포맷을 바꾼다.
+fn convert_cmd(file: &std::path::Path, dest: &std::path::Path, overwrite: bool, dry_run: bool) -> Result<()> {
+    if dry_run {
+        let plan = hwp_core::convert::plan(file, dest)?;
+        outln!("{} → {}", file.display(), dest.display());
+        outln!("  백엔드         {}", plan["backend"].as_str().unwrap_or("?"));
+        outln!(
+            "  대조할 것      본문 {}단락 · 표 {}개 · 칸 {}개 · 그림 {}개",
+            plan["willCompare"]["paragraphs"], plan["willCompare"]["tables"],
+            plan["willCompare"]["cells"], plan["willCompare"]["images"]
+        );
+        outln!("  (바꾸지 않았습니다 — `--dry-run` 입니다)");
+        return Ok(());
+    }
+    let pin = hwp_core::Pin::load_default()?;
+    let rhwp = hwp_core::Rhwp::discover(&pin)?;
+    let r = hwp_core::convert::convert(&rhwp, file, dest, overwrite)?;
+    outln!("{} 로 바꿨습니다 ({})", r.path.display(), r.to);
+    outln!(
+        "  증인이 대조했습니다 — 본문 {}단락 · 표 칸 {}개 · 그림 {}개",
+        r.paragraphs, r.cells, r.images
+    );
+    // **경고는 조용히 넘기지 않는다.** 막지 않은 차이도 사용자가 알아야 한다.
+    for w in &r.warnings {
+        outln!("  ⚠ {w}");
+    }
+    Ok(())
 }
 
 fn set_cell(file: &std::path::Path, assignments: &[String], output: Option<PathBuf>) -> Result<()> {
