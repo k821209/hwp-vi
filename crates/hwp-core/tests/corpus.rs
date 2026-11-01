@@ -4355,6 +4355,116 @@ fn the_two_formats_agree_on_char_size_and_page_setup() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **규격이 정해진 문서를 만들 수 있어야 한다 — 그리고 되읽어 확인한다.**
+///
+/// 사용자 보고(hwp-vi#4): `create` 로는 글자 크기·여백을 지정할 수 없어서
+/// 규격이 정해진 제출 문서를 만들 수 없었다.
+///
+/// > A4규격: 글자 13포인트, 줄 간격 160%, 상하여백 15, 좌우여백 25
+///
+/// 그리고 그 서식은 **원고 A4 매당 정산**이다. 10pt·여백 30mm 로 나오면 같은
+/// 글이 더 적은 쪽에 담기므로 서식 위반이자 정산 근거의 소실이다.
+///
+/// 백엔드의 `scaffold` 는 그 칸을 받지 않으므로 **우리가 HWPX 의 XML 을
+/// 고친다**. 그래도 되는 이유는 **증인이 그 값을 되읽을 수 있기** 때문이다 —
+/// 읽지 못하는 것은 쓰지 않는다. 이 시험이 그 고리를 지킨다.
+#[test]
+fn a_document_made_to_a_spec_has_the_typography_it_asked_for() {
+    let Some((rhwp, _)) = backend() else { return };
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-spec-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let dest = dir.join("made.hwpx");
+
+    let spec: serde_json::Value = serde_json::json!({
+        "version": "1",
+        "title": "규격 문서",
+        "font": "함초롬바탕",
+        "font_size_pt": 13,
+        "margins_mm": {"top": 15, "bottom": 15, "left": 25, "right": 25},
+        "blocks": [
+            {"type": "heading", "level": 1, "text": "1. 개요"},
+            {"type": "paragraph", "text": " ○ 규격에 맞춘 본문 한 줄"},
+            {"type": "paragraph", "text": " ○ 또 한 줄"},
+        ]
+    });
+
+    hwp_core::create::create(&rhwp, &spec, &dest)
+        .unwrap_or_else(|e| panic!("규격 문서 만들기: {e:#}"));
+
+    // ---- 증인으로 되읽는다
+    let t = Testimony::read(&dest).expect("증인");
+    let page = t.page.expect("쪽 설정");
+    let mm = |v: u32| (hwp_core::witness::PageSetup::mm(v) * 10.0).round() / 10.0;
+    assert_eq!(mm(page.left), 25.0, "좌 여백");
+    assert_eq!(mm(page.right), 25.0, "우 여백");
+    assert_eq!(mm(page.top), 15.0, "상 여백");
+    assert_eq!(mm(page.bottom), 15.0, "하 여백");
+
+    // 본문 글줄만 13pt — **제목·머리글은 건드리지 않는다**
+    let mut body = 0usize;
+    let mut other = 0usize;
+    for p in t.body_paragraphs() {
+        let text = hwp_core::offset::visible(&p.text);
+        let sizes: Vec<u32> = p.runs.iter().map(|r| r.size_100pt).collect();
+        if text.trim().starts_with('○') {
+            assert!(
+                sizes.iter().all(|s| *s == 1300),
+                "본문이 13pt 가 아니다: {text:?} {sizes:?}"
+            );
+            body += 1;
+        } else if !sizes.is_empty() {
+            assert!(
+                sizes.iter().all(|s| *s != 1300),
+                "제목·머리글까지 13pt 로 바꿨다: {text:?} {sizes:?}"
+            );
+            other += 1;
+        }
+    }
+    assert_eq!(body, 2, "본문 글줄 둘을 확인해야 한다");
+    assert!(other > 0, "제목·머리글을 하나도 못 봤다 — 안 건드렸는지 확인할 수 없다");
+
+    // ---- **백엔드도 받아야 한다.** 우리가 다시 묶은 ZIP 이므로 이게 관문이다.
+    //
+    // `mimetype` 을 맨 앞에 무압축으로 두지 않으면 한글이 못 연다. 한글은
+    // 여기서 띄울 수 없지만, 백엔드가 거부하면 우리가 묶는 방식이 틀린 것이다.
+    let out = dir.join("back.hwp");
+    let (sp, op) = (dest.display().to_string(), out.display().to_string());
+    rhwp.run(&["convert", &sp, &op, "--verify"])
+        .unwrap_or_else(|e| panic!("우리가 묶은 HWPX 를 백엔드가 거부했다: {e:#}"));
+
+    // ---- **변환해도 수가 남아야 한다.** 제출은 `.hwp` 로 하는 일이 많다.
+    let back = Testimony::read(&out).expect("증인 hwp");
+    let bp = back.page.expect("쪽 설정 hwp");
+    assert_eq!(mm(bp.left), 25.0, ".hwp 로 바꾼 뒤 좌 여백");
+    assert_eq!(mm(bp.top), 15.0, ".hwp 로 바꾼 뒤 상 여백");
+    assert!(
+        back.body_paragraphs()
+            .iter()
+            .filter(|p| hwp_core::offset::visible(&p.text).trim().starts_with('○'))
+            .all(|p| p.runs.iter().all(|r| r.size_100pt == 1300)),
+        ".hwp 로 바꾼 뒤 본문이 13pt 가 아니다"
+    );
+
+    // ---- 받지 않는 값은 거부한다
+    let bad = serde_json::json!({
+        "version": "1", "title": "t", "font_size_pt": 999,
+        "blocks": [{"type": "paragraph", "text": "가"}]
+    });
+    let e = hwp_core::create::create(&rhwp, &bad, &dir.join("bad.hwpx"))
+        .expect_err("999pt 는 거부해야 한다");
+    assert!(format!("{e:#}").contains("200"), "{e:#}");
+
+    let bad2 = serde_json::json!({
+        "version": "1", "title": "t", "margins_mm": {"middle": 10},
+        "blocks": [{"type": "paragraph", "text": "가"}]
+    });
+    let e2 = hwp_core::create::create(&rhwp, &bad2, &dir.join("bad2.hwpx"))
+        .expect_err("모르는 여백 이름은 거부해야 한다");
+    assert!(format!("{e2:#}").contains("middle"), "{e2:#}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// **코퍼스는 무엇을 못 재는지 스스로 말해야 한다.**
 ///
 /// 이 저장소의 1번 재발 패턴은 "시험을 깔끔하게 하려고 걸러낸 것이 결함이 사는

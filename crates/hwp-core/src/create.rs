@@ -63,8 +63,24 @@ pub struct CreateReport {
 struct Wanted {
     /// 글줄마다 들어가야 할 글자 (heading·paragraph 의 `text`)
     lines: Vec<String>,
+    /// **본문** 글줄만 (`paragraph` 블록). 글자 크기를 거는 자리를 찾는 데
+    /// 쓴다 — "charPr 0 이 본문" 을 코드에 박지 않으려고 글자로 찾는다.
+    body_lines: Vec<String>,
     /// 표마다의 격자
     tables: Vec<Vec<Vec<String>>>,
+    /// 본문 글자 크기, 1/100 pt. 명세의 `font_size_pt` 에서.
+    font_size_100pt: Option<u32>,
+    /// 여백, HWPUNIT. 명세의 `margins_mm` 에서.
+    margins: Option<Margins>,
+}
+
+/// 여백 — HWPUNIT.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Margins {
+    left: Option<u32>,
+    right: Option<u32>,
+    top: Option<u32>,
+    bottom: Option<u32>,
 }
 
 fn wanted_from(spec: &Value) -> Result<Wanted> {
@@ -75,7 +91,63 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
     if blocks.is_empty() {
         bail!("명세의 `blocks` 가 비었습니다 — 빈 문서는 만들 것이 없습니다");
     }
+    // **우리가 더한 칸.** 백엔드의 `scaffold` 는 이것을 받지 않으므로
+    // 넘기기 전에 떼어 내고(아래 `create`), 만든 뒤 우리가 XML 을 고친다.
+    //
+    // 사용자 보고(hwp-vi#4): 규격이 정해진 제출 문서를 만들 수 없었다.
+    // "A4규격: 글자 13포인트 … 상하여백 15, 좌우여백 25" 이고 **원고 A4 매당
+    // 정산**이라, 10pt·여백 30mm 로 나오면 서식 위반이자 정산 근거의 소실이다.
+    let font_size_100pt = match spec.get("font_size_pt") {
+        None => None,
+        Some(v) => {
+            let pt = v.as_f64().ok_or_else(|| {
+                anyhow::anyhow!("`font_size_pt` 는 수여야 합니다 (예: 13 또는 13.5)")
+            })?;
+            if !(1.0..=200.0).contains(&pt) {
+                bail!("`font_size_pt` 가 {pt} 입니다 — 1~200 사이여야 합니다");
+            }
+            Some((pt * 100.0).round() as u32)
+        }
+    };
+    let margins = match spec.get("margins_mm") {
+        None => None,
+        Some(v) => {
+            let o = v.as_object().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`margins_mm` 는 객체여야 합니다 \
+                     (예: {{\"top\":15,\"bottom\":15,\"left\":25,\"right\":25}})"
+                )
+            })?;
+            for k in o.keys() {
+                if !matches!(k.as_str(), "top" | "bottom" | "left" | "right") {
+                    bail!("`margins_mm` 의 `{k}` 는 받지 않습니다 (top|bottom|left|right)");
+                }
+            }
+            let one = |k: &str| -> Result<Option<u32>> {
+                match o.get(k) {
+                    None => Ok(None),
+                    Some(x) => {
+                        let mm = x
+                            .as_f64()
+                            .ok_or_else(|| anyhow::anyhow!("`margins_mm.{k}` 는 수여야 합니다"))?;
+                        if !(0.0..=100.0).contains(&mm) {
+                            bail!("`margins_mm.{k}` 가 {mm} 입니다 — 0~100 mm 사이여야 합니다");
+                        }
+                        Ok(Some(crate::hwpx::mm_to_hwpunit(mm)))
+                    }
+                }
+            };
+            Some(Margins {
+                left: one("left")?,
+                right: one("right")?,
+                top: one("top")?,
+                bottom: one("bottom")?,
+            })
+        }
+    };
+
     let mut lines = Vec::new();
+    let mut body_lines = Vec::new();
     let mut tables = Vec::new();
     for (i, b) in blocks.iter().enumerate() {
         let kind = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -85,6 +157,9 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
                     anyhow::anyhow!("blocks[{i}] ({kind}) 에 `text` 가 없습니다")
                 })?;
                 lines.push(t.to_string());
+                if kind == "paragraph" {
+                    body_lines.push(t.to_string());
+                }
             }
             "table" => {
                 let rows = b.get("rows").and_then(|r| r.as_array()).ok_or_else(|| {
@@ -121,7 +196,7 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
             ),
         }
     }
-    Ok(Wanted { lines, tables })
+    Ok(Wanted { lines, body_lines, tables, font_size_100pt, margins })
 }
 
 /// 미리보기 — **실제로 만들어 보고 버린다.**
@@ -210,9 +285,17 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
     let _spec_guard = Cleanup(spec_path.clone());
     let _tmp_guard = Cleanup(tmp.clone());
 
+    // **우리 칸은 떼어 내고 넘긴다.** 백엔드의 `scaffold` 는 모르는 칸을
+    // 거부한다(그게 맞다 — 오타를 조용히 무시하는 것보다 낫다). 떼어 낸
+    // 것들은 만든 뒤 우리가 XML 에 적는다.
+    let mut passthrough = spec.clone();
+    if let Some(o) = passthrough.as_object_mut() {
+        o.remove("font_size_pt");
+        o.remove("margins_mm");
+    }
     std::fs::write(
         &spec_path,
-        serde_json::to_vec_pretty(spec).context("명세를 JSON 으로 쓸 수 없습니다")?,
+        serde_json::to_vec_pretty(&passthrough).context("명세를 JSON 으로 쓸 수 없습니다")?,
     )
     .with_context(|| format!("{} 에 쓸 수 없습니다", spec_path.display()))?;
 
@@ -229,6 +312,38 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
 
     if !tmp.exists() {
         bail!("백엔드가 성공했다고 했는데 파일이 없습니다: {}", tmp.display());
+    }
+
+    // **백엔드가 안 받는 조판은 우리가 적는다.**
+    //
+    // HWPX 는 ZIP + XML 이므로 고칠 수 있다. 그리고 바로 아래에서 **증인이
+    // 되읽어 대조**하므로, 우리가 쓴 것도 백엔드가 쓴 것과 같은 관문을
+    // 지난다 — 읽을 수 있는 것만 쓰는 이유가 그것이다.
+    if want.font_size_100pt.is_some() || want.margins.is_some() {
+        let mut pkg = crate::hwpx::Package::open(&tmp)
+            .with_context(|| format!("{} 를 풀 수 없습니다", tmp.display()))?;
+        if let Some(h) = want.font_size_100pt {
+            // 글자로 찾는다 — "charPr 0 이 본문" 을 박지 않는다
+            let ids = crate::hwpx::char_pr_ids_for(&pkg, &want.body_lines);
+            if ids.is_empty() {
+                bail!(
+                    "`font_size_pt` 를 걸 자리를 찾지 못했습니다 — 본문(`paragraph`) \
+                     블록이 있어야 합니다"
+                );
+            }
+            let n = crate::hwpx::set_char_height(&mut pkg, &ids, h)?;
+            if n == 0 {
+                bail!("글자 크기를 적지 못했습니다 (charPr {ids:?})");
+            }
+        }
+        if let Some(m) = want.margins {
+            let n = crate::hwpx::set_margins(&mut pkg, m.left, m.right, m.top, m.bottom)?;
+            if n == 0 {
+                bail!("여백을 적지 못했습니다 — `hp:margin` 을 찾지 못했습니다");
+            }
+        }
+        pkg.write(&tmp)
+            .with_context(|| format!("{} 를 다시 묶을 수 없습니다", tmp.display()))?;
     }
 
     // **독립 대조.** 백엔드가 센 수를 받아 적지 않고 증인이 직접 읽는다.
@@ -301,6 +416,59 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
                     diffs.push(format!(
                         "표{i} ({r},{c}) 의 글자가 다릅니다 — 명세 {wc:?} / 만들어진 것 {gc:?}"
                     ));
+                }
+            }
+        }
+    }
+
+    // 3) **조판 — 우리가 적은 것도 되읽어 대조한다.**
+    //
+    // 이게 "읽을 수 있는 것만 쓴다" 의 값이다. 증인이 글자 크기와 쪽 설정을
+    // 읽으므로, 우리가 XML 에 적은 수가 실제로 들어갔는지 확인할 수 있다 —
+    // 확인할 수 없으면 적지 않는다.
+    if let Some(want_h) = want.font_size_100pt {
+        // 본문 글줄이 그 크기로 되읽히는가
+        let mut seen = 0usize;
+        for line in &want.body_lines {
+            let Some(p) = witness
+                .body_paragraphs()
+                .into_iter()
+                .find(|p| crate::offset::visible(&p.text).trim() == line.trim())
+            else {
+                continue;
+            };
+            seen += 1;
+            let got: Vec<u32> = p.runs.iter().map(|r| r.size_100pt).collect();
+            if !got.iter().all(|g| *g == want_h) {
+                diffs.push(format!(
+                    "본문 글자 크기가 다릅니다 — 요청 {:.1}pt / 만들어진 것 {:?}pt ({line:?})",
+                    want_h as f64 / 100.0,
+                    got.iter().map(|g| *g as f64 / 100.0).collect::<Vec<_>>()
+                ));
+            }
+        }
+        if seen == 0 {
+            diffs.push("본문 글줄을 되읽지 못해 글자 크기를 확인할 수 없습니다".into());
+        }
+    }
+    if let Some(m) = want.margins {
+        match witness.page {
+            None => diffs.push("쪽 설정을 되읽지 못해 여백을 확인할 수 없습니다".into()),
+            Some(g) => {
+                for (name, want_v, got_v) in [
+                    ("left", m.left, g.left),
+                    ("right", m.right, g.right),
+                    ("top", m.top, g.top),
+                    ("bottom", m.bottom, g.bottom),
+                ] {
+                    let Some(w) = want_v else { continue };
+                    if w != got_v {
+                        diffs.push(format!(
+                            "여백 {name} 이 다릅니다 — 요청 {:.1}mm / 만들어진 것 {:.1}mm",
+                            crate::witness::PageSetup::mm(w),
+                            crate::witness::PageSetup::mm(got_v)
+                        ));
+                    }
                 }
             }
         }
