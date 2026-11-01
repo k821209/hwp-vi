@@ -79,6 +79,32 @@ pub enum Op {
     InsertTextInCell { table: u32, row: usize, col: usize, cell_para: usize, offset: usize, text: String },
     /// `edit delete-text-in-cell` — 칸 안 문단에서 글자를 지운다.
     DeleteTextInCell { table: u32, row: usize, col: usize, cell_para: usize, offset: usize, count: usize },
+    /// `edit apply-char-format` — 글자 꾸밈을 건다/푼다.
+    ///
+    /// 사용자 보고(hwp-vi#5): 읽기에는 `styles`·`deco` 가 있는데 그에 대응하는
+    /// 쓰기 연산이 하나도 없다 — "읽어서 알 수 있는데 만들 수 없으면, AI 가
+    /// 문서를 고칠 수는 있어도 쓸 수는 없다".
+    ///
+    /// **받는 것은 세 가지뿐이다** — 실측으로 정했다. 백엔드는 `--props` 의
+    /// 모르는 키를 **조용히 무시하고 성공을 보고한다**(`boldd` 로 확인).
+    /// 그래서 "듣는 키" 를 되읽어 가려냈다:
+    ///
+    /// | 준 것 | 결과 |
+    /// |---|---|
+    /// | `bold`·`italic`·`underline` 에 `true`/`false` | **듣는다** (켜고 끄기 둘 다) |
+    /// | `underline: "SOLID"` (글자) | 아무 일도 안 일어난다 |
+    /// | `strikeout`·`strike` (무엇을 줘도) | **아무 일도 안 일어난다** |
+    ///
+    /// 그래서 취소선은 받지 않는다. 받아 두면 "걸었다" 고 말하고 아무 일도
+    /// 하지 않는 연산이 된다 — 이 저장소가 가장 피하려는 모양이다.
+    SetDeco {
+        at: Coord,
+        offset: usize,
+        count: usize,
+        bold: Option<bool>,
+        italic: Option<bool>,
+        underline: Option<bool>,
+    },
     /// `edit delete-table` — 표를 지운다. **단락은 남는다.**
     ///
     /// 사용자 보고(2026-10-29): 다른 세션이 HWPX 의 zip 을 풀어 XML 을 직접
@@ -221,6 +247,22 @@ impl Op {
                 "--count".into(), count.to_string(),
                 "-o".into(), output.into(),
             ],
+            Op::SetDeco { at, offset, count, bold, italic, underline } => {
+                let mut props = serde_json::Map::new();
+                for (k, v) in [("bold", bold), ("italic", italic), ("underline", underline)] {
+                    if let Some(v) = v {
+                        props.insert(k.into(), serde_json::Value::Bool(*v));
+                    }
+                }
+                vec![
+                    "edit".into(), "apply-char-format".into(), input.into(),
+                    "--props".into(), serde_json::Value::Object(props).to_string(),
+                    "--section".into(), s(at.0), "--para".into(), s(at.1),
+                    "--offset".into(), offset.to_string(),
+                    "--count".into(), count.to_string(),
+                    "-o".into(), output.into(),
+                ]
+            }
             Op::DeleteTable { table, .. } => vec![
                 "edit".into(), "delete-table".into(), input.into(),
                 "--table".into(), table.to_string(),
@@ -263,6 +305,19 @@ impl Op {
                     lines[0]
                 ),
             },
+            Op::SetDeco { at, offset, count, bold, italic, underline } => {
+                let mut what: Vec<String> = Vec::new();
+                for (name, v) in [("진하게", bold), ("기울임", italic), ("밑줄", underline)] {
+                    if let Some(v) = v {
+                        what.push(format!("{name} {}", if *v { "켜기" } else { "끄기" }));
+                    }
+                }
+                format!(
+                    "구역{} 단락{} 의 {offset}번째부터 {count}자에 {}",
+                    at.0, at.1,
+                    what.join(" · ")
+                )
+            }
             Op::DeleteTable { at, table } => {
                 format!("구역{} 단락{} 의 표{table} 지우기 (단락은 빈 채로 남습니다)", at.0, at.1)
             }
@@ -402,6 +457,58 @@ pub struct Snapshot {
     pub cells: BTreeMap<CellAt, String>,
     /// 이 단락에 달린 그리기개체(표·그림·글상자)의 수. 0 인 단락은 넣지 않는다.
     pub drawings: BTreeMap<Coord, usize>,
+    /// **보이는 글자마다의 꾸밈 표** — `B`·`I`·`U`·`S` 조합. 빈 글자는 꾸밈 없음.
+    ///
+    /// 구간이 아니라 글자별로 든다. 구간 경계는 포맷·판에 따라 갈리는데
+    /// (변환을 재면서 확인했다) 글자마다의 속성은 갈리지 않는다.
+    pub deco: BTreeMap<Coord, Vec<String>>,
+    /// **꾸밈을 대조할 단락.** 여기 든 좌표만 비교한다.
+    ///
+    /// 왜 전부가 아닌가. 글자를 고치는 연산도 꾸밈을 바꾼다 — 넣은 글자는
+    /// **왼쪽 구간의 속성을 물려받는다**(체크박스 작업에서 실측). 그 셈을 모든
+    /// 연산에 모델링하면 틀릴 자리가 많고, 틀리면 꾸밈이 있는 문서의 저장이
+    /// 전부 막힌다. 그래서 **우리가 바꾸겠다고 말한 단락만** 대조한다 —
+    /// 그것이 `set-deco` 가 하는 약속의 범위다.
+    ///
+    /// 남는 구멍: 글자를 고치는 연산이 **다른 곳의** 꾸밈을 조용히 바꾸는
+    /// 경우는 여전히 안 잡힌다. 적어 두고 다음에 본다.
+    pub deco_checked: std::collections::BTreeSet<Coord>,
+}
+
+/// 보이는 글자마다의 꾸밈 표. 컨트롤 자리는 빠진다 — 편집 오프셋이 그 기준이다.
+///
+/// 구간(`Run`)은 **날 글자** 기준이고 여기 글자는 **보이는 글자**다. 그래서
+/// 날 글자를 훑으며 보이는 자리만 적는다 — 두 기준을 섞으면 꾸밈이 한 칸씩
+/// 밀린다(변환을 재면서 그 꼴을 봤다).
+pub fn deco_marks(p: &crate::witness::Para) -> Vec<String> {
+    let raw: Vec<char> = p.text.chars().collect();
+    // 날 글자 순번 → 보이는 글자 순번
+    let mut to_visible = vec![usize::MAX; raw.len()];
+    let mut n = 0usize;
+    for (i, c) in raw.iter().enumerate() {
+        if *c != crate::offset::CONTROL {
+            to_visible[i] = n;
+            n += 1;
+        }
+    }
+    let mut marks = vec![String::new(); n];
+    for r in &p.runs {
+        for i in r.start..(r.start + r.len).min(raw.len()) {
+            let v = to_visible[i];
+            if v == usize::MAX {
+                continue;
+            }
+            let d = &r.deco;
+            marks[v] = format!(
+                "{}{}{}{}",
+                if d.bold { "B" } else { "" },
+                if d.italic { "I" } else { "" },
+                if d.underline { "U" } else { "" },
+                if d.strike { "S" } else { "" }
+            );
+        }
+    }
+    marks
 }
 
 /// 지금 문서의 비교 단위를 뜬다. 저장 경로와 `hwp api` 가 **같은 것**을 본다 —
@@ -411,6 +518,14 @@ pub fn snapshot(t: &Testimony) -> Snapshot {
         .body_paragraphs()
         .into_iter()
         .filter_map(|p| p.index.map(|i| ((p.section, i), offset::visible(&p.text))))
+        .collect();
+    let deco = t
+        .body_paragraphs()
+        .into_iter()
+        .filter_map(|p| {
+            let i = p.index?;
+            Some(((p.section, i), deco_marks(&p)))
+        })
         .collect();
     let cells = t
         .tables
@@ -430,7 +545,7 @@ pub fn snapshot(t: &Testimony) -> Snapshot {
             (n > 0).then_some(((p.section, i), n))
         })
         .collect();
-    Snapshot { paras, cells, drawings }
+    Snapshot { paras, cells, drawings, deco, deco_checked: Default::default() }
 }
 
 /// **다른 이름으로 쓸 때 형식이 같은지 본다.**
@@ -596,6 +711,10 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 *slot = text.clone();
             }
             Op::InsertText { at, offset, text } => {
+                // **글자를 고치면 꾸밈 예측을 버린다.** 넣은 글자가 왼쪽
+                // 구간의 속성을 물려받으므로 우리가 예측한 표가 더 이상 맞지
+                // 않는다 — 모르는 것을 안다고 하지 않는다.
+                cur.deco_checked.remove(at);
                 let s = cur
                     .paras
                     .get_mut(at)
@@ -610,6 +729,7 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 *s = next;
             }
             Op::DeleteText { at, offset, count } => {
+                cur.deco_checked.remove(at);
                 let s = cur
                     .paras
                     .get_mut(at)
@@ -627,6 +747,9 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 *s = next;
             }
             Op::InsertParagraph { at } => {
+                // 좌표가 밀리므로 꾸밈 예측은 전부 버린다 — 밀린 자리를 다시
+                // 맞추는 셈을 여기 한 벌 더 적지 않는다.
+                cur.deco_checked.clear();
                 cur.paras = shift(cur.paras, at.0, at.1, 1);
                 cur.drawings = shift(cur.drawings, at.0, at.1, 1);
                 cur.paras.insert(*at, String::new());
@@ -669,6 +792,44 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 next.extend(&chars[end..]);
                 *p = next;
                 *slot = paras.join("\n");
+            }
+            Op::SetDeco { at, offset, count, bold, italic, underline } => {
+                let marks = cur.deco.get_mut(at).with_context(|| {
+                    format!("없는 단락의 꾸밈을 고치려 합니다: 구역{} 단락{}", at.0, at.1)
+                })?;
+                let end = offset.saturating_add(*count);
+                if end > marks.len() {
+                    bail!(
+                        "구역{} 단락{} 은 {}자인데 {offset}번째부터 {count}자에 걸 수 없습니다",
+                        at.0, at.1,
+                        marks.len()
+                    );
+                }
+                if *count == 0 {
+                    bail!("꾸밈을 걸 글자가 0자입니다 — `count` 를 1 이상으로 주세요");
+                }
+                for m in marks[*offset..end].iter_mut() {
+                    let mut on: Vec<char> = m.chars().collect();
+                    let flip = |on: &mut Vec<char>, c: char, v: Option<bool>| match v {
+                        Some(true) => {
+                            if !on.contains(&c) {
+                                on.push(c);
+                            }
+                        }
+                        Some(false) => on.retain(|x| *x != c),
+                        None => {}
+                    };
+                    flip(&mut on, 'B', *bold);
+                    flip(&mut on, 'I', *italic);
+                    flip(&mut on, 'U', *underline);
+                    // 표기 순서를 고정한다 — 비교 단위이므로 순서가 흔들리면 안 된다
+                    *m = ['B', 'I', 'U', 'S']
+                        .into_iter()
+                        .filter(|c| on.contains(c))
+                        .collect();
+                }
+                // **이 단락은 대조한다.** 우리가 바꾸겠다고 말했으니까.
+                cur.deco_checked.insert(*at);
             }
             Op::DeleteTable { at, table } => {
                 // 표 번호가 당겨지는 것은 `InsertTable` 의 거울이다. 다만
@@ -765,6 +926,7 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 }
             }
             Op::DeleteParagraph { at } => {
+                cur.deco_checked.clear();
                 // **개체가 달린 단락은 지우지 않는다.**
                 //
                 // 지우면 그 표·그림·글상자가 문서에서 함께 사라지는데, 우리는
@@ -881,6 +1043,37 @@ fn diff_report(
             got.cells.len()
         ));
     }
+    // **우리가 바꾸겠다고 말한 꾸밈은 들어갔는가.**
+    //
+    // 백엔드는 `--props` 의 모르는 키를 조용히 무시하고 성공을 보고한다
+    // (실측). 되읽어 대조하지 않으면 `set-deco` 가 그 결함을 그대로 물려받아
+    // "걸었다" 고 말하고 아무 일도 하지 않는 연산이 된다.
+    for at in &want.deco_checked {
+        let w = want.deco.get(at);
+        let g = got.deco.get(at);
+        if w == g {
+            continue;
+        }
+        match (w, g) {
+            (Some(w), Some(g)) if w.len() == g.len() => {
+                let first = w.iter().zip(g).position(|(a, b)| a != b).unwrap_or(0);
+                lines.push(format!(
+                    "구역{} 단락{} 의 글자 꾸밈이 다릅니다 — {first}번째 글자: 기대 {:?} / 실제 {:?}",
+                    at.0, at.1,
+                    if w[first].is_empty() { "없음" } else { &w[first] },
+                    if g[first].is_empty() { "없음" } else { &g[first] }
+                ));
+            }
+            _ => lines.push(format!(
+                "구역{} 단락{} 의 꾸밈 표 길이가 다릅니다 — 기대 {:?} / 실제 {:?}",
+                at.0, at.1,
+                w.map(|v| v.len()),
+                g.map(|v| v.len())
+            )),
+        }
+        break;
+    }
+
     // **개체가 사라졌는지 본다.** 글자와 셀만 비교하던 동안 그림 삭제가
     // 성공으로 보고되었다 (s00.hwp 단락 54, 6→5개).
     {
@@ -1055,6 +1248,8 @@ mod tests {
             .into_iter()
             .collect(),
             drawings: Default::default(),
+            deco: Default::default(),
+            deco_checked: Default::default(),
         }
     }
 

@@ -728,6 +728,8 @@ fn self_verifying_save_refuses_when_the_result_would_differ() {
             paras: [((sec, para), "짧다".to_string())].into_iter().collect(),
             cells: Default::default(),
             drawings: Default::default(),
+            deco: Default::default(),
+            deco_checked: Default::default(),
         },
         &[Op::DeleteText { at: (sec, para), offset: 0, count: 500 }],
     )
@@ -4461,6 +4463,113 @@ fn a_document_made_to_a_spec_has_the_typography_it_asked_for() {
     let e2 = hwp_core::create::create(&rhwp, &bad2, &dir.join("bad2.hwpx"))
         .expect_err("모르는 여백 이름은 거부해야 한다");
     assert!(format!("{e2:#}").contains("middle"), "{e2:#}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **글자 꾸밈을 걸고, 되읽어 확인한다.**
+///
+/// 사용자 보고(hwp-vi#5): 읽기에는 `deco` 가 있는데 쓰기가 없었다 — "읽어서
+/// 알 수 있는데 만들 수 없으면, AI 가 문서를 고칠 수는 있어도 쓸 수는 없다".
+///
+/// **이 시험의 요점은 되읽기다.** 백엔드의 `apply-char-format` 은 `--props` 의
+/// 모르는 키를 **조용히 무시하고 성공을 보고한다**(`boldd` 로 실측). 되읽어
+/// 대조하지 않으면 `set-deco` 가 그 결함을 그대로 물려받아 "걸었다" 고 말하고
+/// 아무 일도 하지 않는 연산이 된다 — 이 저장소가 가장 피하려는 모양이다.
+#[test]
+fn setting_character_decoration_is_verified_by_reading_it_back() {
+    let Some(((rhwp, _), files)) = backend().zip(Some(samples())) else { return };
+    // 꾸밈을 걸 만큼 긴 본문 단락이 있는 문서
+    let Some((src, at, len)) = files.iter().find_map(|f| {
+        let t = Testimony::read(f).ok()?;
+        t.body_paragraphs().into_iter().find_map(|p| {
+            let i = p.index?;
+            let n = hwp_core::offset::visible(&p.text).chars().count();
+            (n >= 12).then_some((f.clone(), (p.section, i), n))
+        })
+    }) else {
+        panic!("12자 이상인 본문 단락이 있는 문서가 코퍼스에 없다");
+    };
+
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-deco-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let doc = dir.join(src.file_name().expect("이름"));
+    std::fs::copy(&src, &doc).expect("문서");
+
+    let marks = |path: &std::path::Path| -> Vec<String> {
+        Testimony::read(path)
+            .expect("증인")
+            .body_paragraphs()
+            .into_iter()
+            .find(|p| (p.section, p.index.unwrap_or(u32::MAX)) == at)
+            .map(|p| hwp_core::edit::deco_marks(&p))
+            .unwrap_or_default()
+    };
+    let before = marks(&doc);
+    assert_eq!(before.len(), len, "꾸밈 표가 글자 수와 달라서는 안 된다");
+
+    // ---- 진하게 + 밑줄을 [3, 8) 에
+    let mut log = hwp_core::edit::EditLog::new();
+    log.push(hwp_core::edit::Op::SetDeco {
+        at,
+        offset: 3,
+        count: 5,
+        bold: Some(true),
+        italic: None,
+        underline: Some(true),
+    });
+    hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("꾸밈 걸기: {e:#}"));
+
+    let after = marks(&doc);
+    assert_eq!(after.len(), before.len(), "글자 수가 달라졌다");
+    for i in 0..after.len() {
+        if (3..8).contains(&i) {
+            assert!(
+                after[i].contains('B') && after[i].contains('U'),
+                "{i}번째 글자에 진하게·밑줄이 걸리지 않았다: {:?}",
+                after[i]
+            );
+        } else {
+            // **건드리지 않은 글자는 그대로다** — 구간 밖으로 번지지 않는다
+            assert_eq!(
+                after[i], before[i],
+                "{i}번째 글자가 바뀌었다 (구간 밖) — 전 {:?} / 후 {:?}",
+                before[i], after[i]
+            );
+        }
+    }
+
+    // ---- 끄기도 된다
+    let mut log2 = hwp_core::edit::EditLog::new();
+    log2.push(hwp_core::edit::Op::SetDeco {
+        at,
+        offset: 3,
+        count: 5,
+        bold: Some(false),
+        italic: None,
+        underline: None,
+    });
+    hwp_core::edit::save(&rhwp, &doc, &log2).unwrap_or_else(|e| panic!("꾸밈 끄기: {e:#}"));
+    let off = marks(&doc);
+    for i in 3..8 {
+        assert!(!off[i].contains('B'), "{i}번째 글자의 진하게가 안 꺼졌다: {:?}", off[i]);
+        assert!(off[i].contains('U'), "{i}번째 글자의 밑줄까지 꺼졌다: {:?}", off[i]);
+    }
+
+    // ---- 글자 수를 넘으면 **저장 전에** 멈춘다
+    let mut bad = hwp_core::edit::EditLog::new();
+    bad.push(hwp_core::edit::Op::SetDeco {
+        at,
+        offset: len,
+        count: 5,
+        bold: Some(true),
+        italic: None,
+        underline: None,
+    });
+    let keep = std::fs::read(&doc).expect("읽기");
+    let e = hwp_core::edit::save(&rhwp, &doc, &bad).expect_err("글자 수를 넘으면 거부해야 한다");
+    assert!(format!("{e:#}").contains("자"), "{e:#}");
+    assert_eq!(std::fs::read(&doc).expect("읽기"), keep, "거부된 편집이 파일을 바꿨다");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

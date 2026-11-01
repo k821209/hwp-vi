@@ -211,6 +211,31 @@ pub enum OpSpec {
         #[serde(default = "yes")]
         checked: bool,
     },
+    /// **글자 꾸밈을 건다/푼다** — 진하게·기울임·밑줄.
+    ///
+    /// 사용자 보고(hwp-vi#5): 읽기에는 `deco` 가 있는데 쓰기가 없었다.
+    ///
+    /// 받는 것은 셋뿐이고 **실측으로 정했다.** 백엔드는 모르는 키를 조용히
+    /// 무시하고 성공을 보고하므로(`boldd` 로 확인), 되읽어 "듣는 키" 를
+    /// 가려냈다 — 취소선은 어떤 키로도 걸리지 않는다.
+    ///
+    /// `strike` 는 **받아서 이유를 말하며 거부한다.** serde 가 "모르는 칸" 으로
+    /// 끝내면 받는 쪽은 왜인지 모르고, 오타인 줄 알고 다시 보낸다.
+    SetDeco {
+        section: u32,
+        para: u32,
+        offset: usize,
+        count: usize,
+        #[serde(default)]
+        bold: Option<bool>,
+        #[serde(default)]
+        italic: Option<bool>,
+        #[serde(default)]
+        underline: Option<bool>,
+        /// 받지 않는다 — 이유를 말하려고 칸만 둔다.
+        #[serde(default)]
+        strike: Option<bool>,
+    },
     /// 글머리 단계를 올리거나 내린다 (`Tab` / `Shift-Tab`)
     Relevel { section: u32, para: u32, delta: isize },
     /// **빈 표를 만든다** — 그 자리에 단락 하나가 함께 들어간다.
@@ -369,6 +394,13 @@ pub const CAPS: &[Cap] = &[
         id: "check-in-cell",
         what: "표 칸의 체크박스를 켜거나 끈다 — 좌표는 `checks` 가 준다",
         machine: Machine::Op("check-in-cell"),
+        ex: &[],
+    },
+    Cap {
+        id: "set-deco",
+        what: "글자 꾸밈을 건다/푼다 — 진하게·기울임·밑줄 (취소선은 백엔드가 \
+               걸지 못한다). 구간은 `deco` 가 주는 좌표와 같다",
+        machine: Machine::Op("set-deco"),
         ex: &[],
     },
     Cap {
@@ -1296,6 +1328,7 @@ fn op_name(spec: &OpSpec) -> &'static str {
         OpSpec::DeletePara { .. } => "delete-para",
         OpSpec::Check { .. } => "check",
         OpSpec::CheckInCell { .. } => "check-in-cell",
+        OpSpec::SetDeco { .. } => "set-deco",
         OpSpec::Relevel { .. } => "relevel",
         OpSpec::InsertTable { .. } => "insert-table",
         OpSpec::DeleteTable { .. } => "delete-table",
@@ -1666,6 +1699,42 @@ fn lower(
                     index,
                 }],
                 Some(format!("표{index} 가 된다 ({rows}×{cols})")),
+            )
+        }
+        OpSpec::SetDeco { section, para, offset, count, bold, italic, underline, strike } => {
+            if strike.is_some() {
+                anyhow::bail!(
+                    "취소선은 걸 수 없다 — 백엔드의 `apply-char-format` 이 \
+                     `strikeout`·`strike` 를 어떤 값으로 줘도 **아무 일도 하지 않는다**(실측). \
+                     받아 두면 \"걸었다\" 고 말하고 아무 일도 하지 않는 연산이 된다. \
+                     받는 것은 `bold`·`italic`·`underline` 셋이다."
+                );
+            }
+            if bold.is_none() && italic.is_none() && underline.is_none() {
+                anyhow::bail!(
+                    "걸 꾸밈이 없다 — `bold`·`italic`·`underline` 중 하나 이상을 \
+                     `true`(켜기) 또는 `false`(끄기)로 줘라"
+                );
+            }
+            let n = text_at(*section, *para)?.chars().count();
+            if offset + count > n {
+                anyhow::bail!(
+                    "구역{section} 단락{para} 은 {n}자다 — {offset}번째부터 {count}자에 걸 수 없다"
+                );
+            }
+            if *count == 0 {
+                anyhow::bail!("꾸밈을 걸 글자가 0자다 — `count` 를 1 이상으로 줘라");
+            }
+            (
+                vec![Op::SetDeco {
+                    at: (*section, *para),
+                    offset: *offset,
+                    count: *count,
+                    bold: *bold,
+                    italic: *italic,
+                    underline: *underline,
+                }],
+                None,
             )
         }
         OpSpec::Relevel { section, para, delta } => {
@@ -2403,6 +2472,8 @@ mod tests {
             paras: paras.iter().map(|&(s, p, t)| ((s, p), t.to_string())).collect(),
             cells: cells.iter().map(|&(tb, r, c, t)| ((tb, r, c), t.to_string())).collect(),
             drawings: drawings.iter().map(|&(s, p, n)| ((s, p), n)).collect(),
+            deco: Default::default(),
+            deco_checked: Default::default(),
         }
     }
 
