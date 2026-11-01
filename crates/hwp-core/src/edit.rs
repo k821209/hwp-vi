@@ -105,6 +105,19 @@ pub enum Op {
         italic: Option<bool>,
         underline: Option<bool>,
     },
+    /// **문단 정렬을 바꾼다 — 우리가 직접.** 백엔드를 쓰지 않는다.
+    ///
+    /// 백엔드에 `apply-para-format` 이 있지만 **못 믿는다**(실측 2026-10-09):
+    /// 모르는 키를 조용히 무시하고 성공을 보고하며, 아는 키는 **값을 절반만**
+    /// 반영한다(HWPUNIT 의 ½ 단위로 저장하는데 받은 수를 그대로 적는다).
+    /// 그 위에 연산을 올리면 말한 것과 다른 값을 쓰는 연산이 된다.
+    ///
+    /// 그래서 HWPX 의 XML 을 우리가 고친다. **증인이 단락 정렬을 읽으므로**
+    /// 쓴 것을 되읽어 대조할 수 있다 — 읽지 못하는 것은 쓰지 않는다.
+    ///
+    /// `.hwp`(CFB)는 **할 수 없다.** 우리에게 CFB 작성기가 없다 — 그쪽은
+    /// `convert` 로 HWPX 로 바꾼 뒤 고치는 길이 있다.
+    SetParaAlign { at: Coord, align: crate::witness::ParaAlign },
     /// `edit delete-table` — 표를 지운다. **단락은 남는다.**
     ///
     /// 사용자 보고(2026-10-29): 다른 세션이 HWPX 의 zip 을 풀어 XML 을 직접
@@ -247,6 +260,9 @@ impl Op {
                 "--count".into(), count.to_string(),
                 "-o".into(), output.into(),
             ],
+            // **우리가 직접 하는 연산은 백엔드 명령이 없다.** 재생 루프가
+            // `local()` 을 보고 `apply_local` 로 보낸다.
+            Op::SetParaAlign { .. } => Vec::new(),
             Op::SetDeco { at, offset, count, bold, italic, underline } => {
                 let mut props = serde_json::Map::new();
                 for (k, v) in [("bold", bold), ("italic", italic), ("underline", underline)] {
@@ -284,6 +300,43 @@ impl Op {
         }
     }
 
+    /// **우리가 직접 하는 연산인가.** 백엔드 명령이 없다.
+    ///
+    /// 백엔드가 못 하거나 못 믿을 자리에만 쓴다. 지금은 문단 정렬 하나다 —
+    /// `apply-para-format` 이 모르는 키를 조용히 무시하고 값을 절반만
+    /// 반영하므로(실측), 그 위에 연산을 올릴 수 없었다.
+    pub fn local(&self) -> bool {
+        matches!(self, Op::SetParaAlign { .. })
+    }
+
+    /// 우리 손으로 고친다. HWPX 만 된다.
+    pub fn apply_local(&self, src: &Path, dst: &Path) -> Result<()> {
+        // `.hwp`(CFB)는 우리에게 작성기가 없다. 조용히 넘기지 않고 길을 말한다.
+        let is_zip = {
+            let mut head = [0u8; 2];
+            use std::io::Read;
+            std::fs::File::open(src)
+                .and_then(|mut f| f.read_exact(&mut head))
+                .map(|_| &head == b"PK")
+                .unwrap_or(false)
+        };
+        if !is_zip {
+            bail!(
+                "{} 은 HWPX 가 아닙니다 — 이 연산은 우리가 XML 을 고치므로 HWPX 만 됩니다. \
+                 `.hwp` 는 `hwp convert` 로 `.hwpx` 로 바꾼 뒤 고치세요 (변환은 무손실입니다).",
+                src.display()
+            );
+        }
+        let mut pkg = crate::hwpx::Package::open(src)?;
+        match self {
+            Op::SetParaAlign { at, align } => {
+                crate::hwpx::set_para_align(&mut pkg, at.0, at.1, align.owpml())?;
+            }
+            other => bail!("우리가 직접 할 수 있는 연산이 아닙니다: {}", other.describe()),
+        }
+        pkg.write(dst)
+    }
+
     /// 사람에게 보여 줄 한 줄.
     pub fn describe(&self) -> String {
         match self {
@@ -305,6 +358,11 @@ impl Op {
                     lines[0]
                 ),
             },
+            Op::SetParaAlign { at, align } => format!(
+                "구역{} 단락{} 의 정렬을 {}로",
+                at.0, at.1,
+                align.label()
+            ),
             Op::SetDeco { at, offset, count, bold, italic, underline } => {
                 let mut what: Vec<String> = Vec::new();
                 for (name, v) in [("진하게", bold), ("기울임", italic), ("밑줄", underline)] {
@@ -462,6 +520,12 @@ pub struct Snapshot {
     /// 구간이 아니라 글자별로 든다. 구간 경계는 포맷·판에 따라 갈리는데
     /// (변환을 재면서 확인했다) 글자마다의 속성은 갈리지 않는다.
     pub deco: BTreeMap<Coord, Vec<String>>,
+    /// 단락마다의 **정렬**. 문단서식은 `paraPr` 로 공유되므로 이것까지 들어야
+    /// "한 단락만 바뀌었는가" 를 물을 수 있다.
+    pub styles: BTreeMap<Coord, crate::witness::ParaAlign>,
+    /// 정렬을 대조할 단락. `SetParaAlign` 이 **전부** 넣는다 — 공유 때문에
+    /// 다른 단락이 같이 바뀌는 것이 이 연산의 주된 위험이다.
+    pub styles_checked: std::collections::BTreeSet<Coord>,
     /// **꾸밈을 대조할 단락.** 여기 든 좌표만 비교한다.
     ///
     /// 왜 전부가 아닌가. 글자를 고치는 연산도 꾸밈을 바꾼다 — 넣은 글자는
@@ -519,6 +583,11 @@ pub fn snapshot(t: &Testimony) -> Snapshot {
         .into_iter()
         .filter_map(|p| p.index.map(|i| ((p.section, i), offset::visible(&p.text))))
         .collect();
+    let styles = t
+        .body_paragraphs()
+        .into_iter()
+        .filter_map(|p| p.index.map(|i| ((p.section, i), p.style.align)))
+        .collect();
     let deco = t
         .body_paragraphs()
         .into_iter()
@@ -545,7 +614,15 @@ pub fn snapshot(t: &Testimony) -> Snapshot {
             (n > 0).then_some(((p.section, i), n))
         })
         .collect();
-    Snapshot { paras, cells, drawings, deco, deco_checked: Default::default() }
+    Snapshot {
+        paras,
+        cells,
+        drawings,
+        styles,
+        styles_checked: Default::default(),
+        deco,
+        deco_checked: Default::default(),
+    }
 }
 
 /// **다른 이름으로 쓸 때 형식이 같은지 본다.**
@@ -750,6 +827,8 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 // 좌표가 밀리므로 꾸밈 예측은 전부 버린다 — 밀린 자리를 다시
                 // 맞추는 셈을 여기 한 벌 더 적지 않는다.
                 cur.deco_checked.clear();
+                cur.styles_checked.clear();
+                cur.styles = shift(cur.styles, at.0, at.1, 1);
                 cur.paras = shift(cur.paras, at.0, at.1, 1);
                 cur.drawings = shift(cur.drawings, at.0, at.1, 1);
                 cur.paras.insert(*at, String::new());
@@ -792,6 +871,19 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 next.extend(&chars[end..]);
                 *p = next;
                 *slot = paras.join("\n");
+            }
+            Op::SetParaAlign { at, align } => {
+                if !cur.paras.contains_key(at) {
+                    bail!("없는 단락입니다: 구역{} 단락{}", at.0, at.1);
+                }
+                cur.styles.insert(*at, *align);
+                // **모든 단락을 대조 대상에 넣는다.**
+                //
+                // `paraPr` 은 심하게 공유되므로(실측: 한 종을 79 문단이 쓴다)
+                // 제자리에서 고치면 **다른 단락이 같이 바뀐다.** 그걸 잡으려면
+                // 바꾼 단락만 보는 것으로는 모자라다 — 전부 넣어 두고 "하나만
+                // 바뀌었는가" 를 묻는다.
+                cur.styles_checked = cur.styles.keys().copied().collect();
             }
             Op::SetDeco { at, offset, count, bold, italic, underline } => {
                 let marks = cur.deco.get_mut(at).with_context(|| {
@@ -927,6 +1019,7 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
             }
             Op::DeleteParagraph { at } => {
                 cur.deco_checked.clear();
+                cur.styles_checked.clear();
                 // **개체가 달린 단락은 지우지 않는다.**
                 //
                 // 지우면 그 표·그림·글상자가 문서에서 함께 사라지는데, 우리는
@@ -989,6 +1082,20 @@ fn replay(rhwp: &Rhwp, src: &Path, ops: &[Op], workdir: &Path) -> Result<PathBuf
     // 그래서 중간 산출물에 명령 번호까지 붙여 사슬로 잇는다.
     let mut step = 0usize;
     for (n, op) in ops.iter().enumerate() {
+        // **우리가 직접 하는 연산.** 백엔드를 거치지 않고 다음 단계 파일을 만든다.
+        // 그래도 뒤의 대조는 똑같이 지난다 — 쓰는 쪽이 누구든 되읽어 확인한다.
+        if op.local() {
+            step += 1;
+            let output = workdir.join(format!("step{step}.{ext}"));
+            op.apply_local(&input, &output).with_context(|| {
+                format!("{} 번째 연산 실패 — {}", n + 1, op.describe())
+            })?;
+            if !output.exists() {
+                bail!("{} 번째 연산이 출력을 내지 않았습니다 — {}", n + 1, op.describe());
+            }
+            input = output;
+            continue;
+        }
         let cmds = op.commands(&input.to_string_lossy(), "");
         for (k, _) in cmds.iter().enumerate() {
             step += 1;
@@ -1043,6 +1150,24 @@ fn diff_report(
             got.cells.len()
         ));
     }
+    // **정렬이 그 단락만 바뀌었는가.**
+    //
+    // `paraPr` 은 공유되므로(실측: 한 종을 79 문단이 쓴다) 제자리에서 고치면
+    // 다른 단락이 같이 바뀐다. 그래서 바꾼 단락만 보지 않고 **전부** 본다.
+    for at in &want.styles_checked {
+        let w = want.styles.get(at);
+        let g = got.styles.get(at);
+        if w != g {
+            lines.push(format!(
+                "구역{} 단락{} 의 정렬이 다릅니다 — 기대 {} / 실제 {}",
+                at.0, at.1,
+                w.map(|a| a.label()).unwrap_or("없음"),
+                g.map(|a| a.label()).unwrap_or("없음")
+            ));
+            break;
+        }
+    }
+
     // **우리가 바꾸겠다고 말한 꾸밈은 들어갔는가.**
     //
     // 백엔드는 `--props` 의 모르는 키를 조용히 무시하고 성공을 보고한다
@@ -1248,6 +1373,8 @@ mod tests {
             .into_iter()
             .collect(),
             drawings: Default::default(),
+            styles: Default::default(),
+            styles_checked: Default::default(),
             deco: Default::default(),
             deco_checked: Default::default(),
         }

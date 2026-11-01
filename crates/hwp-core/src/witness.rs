@@ -304,6 +304,30 @@ pub enum ParaAlign {
 }
 
 impl ParaAlign {
+    /// 사람에게 보여 줄 이름.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ParaAlign::Justify => "양쪽맞춤",
+            ParaAlign::Left => "왼쪽",
+            ParaAlign::Right => "오른쪽",
+            ParaAlign::Center => "가운데",
+            ParaAlign::Distribute => "배분",
+            ParaAlign::Division => "나눔",
+        }
+    }
+
+    /// OWPML `hh:align/@horizontal` 값.
+    pub fn owpml(&self) -> &'static str {
+        match self {
+            ParaAlign::Justify => "JUSTIFY",
+            ParaAlign::Left => "LEFT",
+            ParaAlign::Right => "RIGHT",
+            ParaAlign::Center => "CENTER",
+            ParaAlign::Distribute => "DISTRIBUTE",
+            ParaAlign::Division => "DIVISION",
+        }
+    }
+
     /// HWP5 문단서식 속성1 의 **비트 2~4**. s00.hwp 본문 174단락에서 변환본
     /// HWPX 의 `hh:align horizontal` 과 174/174 일치했다.
     fn from_bits(attr: u32) -> Self {

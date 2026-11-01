@@ -239,6 +239,9 @@ impl TextFile {
                     lines.remove(i);
                 }
                 // 일반 텍스트 파일에는 서식이 없다
+                Op::SetParaAlign { .. } => {
+                    bail!("{step}번째 연산: 텍스트 파일에는 문단 정렬이 없습니다 — {}", op.describe());
+                }
                 Op::SetDeco { .. } => {
                     bail!("{step}번째 연산: 텍스트 파일에는 글자 꾸밈이 없습니다 — {}", op.describe());
                 }

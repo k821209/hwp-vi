@@ -728,6 +728,8 @@ fn self_verifying_save_refuses_when_the_result_would_differ() {
             paras: [((sec, para), "짧다".to_string())].into_iter().collect(),
             cells: Default::default(),
             drawings: Default::default(),
+            styles: Default::default(),
+            styles_checked: Default::default(),
             deco: Default::default(),
             deco_checked: Default::default(),
         },
@@ -4570,6 +4572,102 @@ fn setting_character_decoration_is_verified_by_reading_it_back() {
     let e = hwp_core::edit::save(&rhwp, &doc, &bad).expect_err("글자 수를 넘으면 거부해야 한다");
     assert!(format!("{e:#}").contains("자"), "{e:#}");
     assert_eq!(std::fs::read(&doc).expect("읽기"), keep, "거부된 편집이 파일을 바꿨다");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **문단 정렬을 바꾸면 그 단락만 바뀌어야 한다.**
+///
+/// 사용자 보고(hwp-vi#5)의 `set-para-style` 중 정렬. 백엔드의
+/// `apply-para-format` 은 못 믿어서(모르는 키를 조용히 무시하고 값을 절반만
+/// 반영한다 — 2026-10-09 실측) **우리가 HWPX 의 XML 을 고친다.**
+///
+/// 여기서 지키는 것은 **번지지 않는 것**이다. `paraPr` 은 심하게 공유된다 —
+/// 실측: s03.hwpx 는 본문 60단락이 27종을 쓰고 그중 한 종을 **9 단락**이
+/// 쓴다(합성 코퍼스의 c00 도 한 종을 10 단락이 쓴다). 제자리에서 고치면 그
+/// 전부가 같이 바뀌므로, `paraPr` 을 새로 만들어 그 단락만 가리키게 한다.
+///
+/// 그리고 **그 번짐이 보일 수 있는 상황인지** 먼저 확인한다 — 같은 정렬인
+/// 다른 단락이 없으면 이 시험은 통과해도 뜻이 없다.
+#[test]
+fn changing_one_paragraphs_alignment_does_not_spread_to_others() {
+    let Some(((rhwp, _), files)) = backend().zip(Some(samples())) else { return };
+    let hwpx: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|f| f.extension().and_then(|s| s.to_str()) == Some("hwpx"))
+        .collect();
+    if hwpx.is_empty() {
+        return;
+    }
+
+    let aligns = |path: &std::path::Path| -> BTreeMap<u32, hwp_core::witness::ParaAlign> {
+        Testimony::read(path)
+            .expect("증인")
+            .body_paragraphs()
+            .into_iter()
+            .filter(|p| p.section == 0)
+            .filter_map(|p| p.index.map(|i| (i, p.style.align)))
+            .collect()
+    };
+
+    // **번짐이 보일 수 있는 자리**를 찾는다: 같은 정렬인 단락이 둘 이상.
+    let Some((src, target, same)) = hwpx.iter().find_map(|f| {
+        let a = aligns(f);
+        a.iter().find_map(|(i, al)| {
+            let mates: Vec<u32> =
+                a.iter().filter(|(j, x)| *j != i && *x == al).map(|(j, _)| *j).collect();
+            (!mates.is_empty()).then(|| (f.clone(), *i, mates))
+        })
+    }) else {
+        panic!("같은 정렬인 본문 단락이 둘 이상인 HWPX 가 코퍼스에 없다 — 이 시험은 그런 문서가 있어야 번짐을 볼 수 있다");
+    };
+
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-align-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let doc = dir.join(src.file_name().expect("이름"));
+    std::fs::copy(&src, &doc).expect("문서");
+
+    let before = aligns(&doc);
+    let was = before[&target];
+    // 지금과 다른 정렬로 바꾼다
+    use hwp_core::witness::ParaAlign;
+    let to = if was == ParaAlign::Center { ParaAlign::Right } else { ParaAlign::Center };
+
+    let mut log = hwp_core::edit::EditLog::new();
+    log.push(hwp_core::edit::Op::SetParaAlign { at: (0, target), align: to });
+    hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("정렬 바꾸기: {e:#}"));
+
+    let after = aligns(&doc);
+    assert_eq!(after.get(&target), Some(&to), "바꾸려던 단락이 안 바뀌었다");
+    // **번지지 않았는가.** 같은 `paraPr` 을 쓰던 단락이 같이 바뀌면 여기서 깨진다.
+    for (i, w) in &before {
+        if *i == target {
+            continue;
+        }
+        assert_eq!(
+            after.get(i),
+            Some(w),
+            "구역0 단락{i} 의 정렬이 번져서 바뀌었다 (같은 정렬이던 단락: {same:?})"
+        );
+    }
+
+    // **백엔드도 받아야 한다.** 우리가 다시 묶은 ZIP 이므로 이게 관문이다.
+    let out = dir.join("back.hwp");
+    let (sp, op) = (doc.display().to_string(), out.display().to_string());
+    rhwp.run(&["convert", &sp, &op, "--verify"])
+        .unwrap_or_else(|e| panic!("우리가 묶은 HWPX 를 백엔드가 거부했다: {e:#}"));
+
+    // ---- `.hwp` 는 할 수 없다고 **말한다**
+    let cfb = dir.join("x.hwp");
+    std::fs::copy(&out, &cfb).expect("복사");
+    let mut log2 = hwp_core::edit::EditLog::new();
+    log2.push(hwp_core::edit::Op::SetParaAlign { at: (0, target), align: to });
+    let e = hwp_core::edit::save(&rhwp, &cfb, &log2).expect_err("`.hwp` 는 거부해야 한다");
+    let msg = format!("{e:#}");
+    assert!(
+        msg.contains("HWPX") && msg.contains("convert"),
+        "거부만 하고 갈 곳을 말하지 않는다: {msg}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

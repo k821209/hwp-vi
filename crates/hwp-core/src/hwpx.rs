@@ -231,6 +231,133 @@ pub fn set_char_height(pkg: &mut Package, ids: &[String], height_100pt: u32) -> 
     Ok(changed)
 }
 
+/// **본문 단락의 정렬을 바꾼다 — 그 단락만.**
+///
+/// `paraPr` 은 **심하게 공유된다.** 실측: s03.hwpx 는 문단 317개가 55종을 쓰고
+/// 그중 한 종을 **79 문단**이 쓴다. 그래서 제자리에서 고치면 79개가 같이
+/// 바뀐다 — 한 단락을 고치려면 **`paraPr` 을 새로 만들어** 그 단락만 가리키게
+/// 해야 한다.
+///
+/// 하는 일: (1) 그 단락의 `paraPrIDRef` 를 읽고 (2) 그 `paraPr` 을 베껴
+/// `hh:align/@horizontal` 만 바꾸고 (3) 새 번호로 `hh:paraProperties` 에 넣고
+/// `itemCnt` 를 올리고 (4) 그 단락이 새 번호를 가리키게 한다.
+///
+/// 단락 번호는 **본문 단락 순번**이다 — 표 셀 안 단락(`hp:subList` 안)은 세지
+/// 않는다. 증인의 `index` 와 같은 기준이어야 좌표가 통한다.
+pub fn set_para_align(pkg: &mut Package, section: u32, para: u32, horizontal: &str) -> Result<()> {
+    let sec_name = format!("Contents/section{section}.xml");
+    let Some(sec) = pkg.text(&sec_name) else {
+        bail!("구역 {section} 이 없습니다 ({sec_name})");
+    };
+
+    // ---- 1) 그 단락을 찾는다 (subList 밖의 `hp:p` 만 센다)
+    // **바이트로 훑는다.** 글자열을 아무 자리에서 자르면 한글 한가운데에서
+    // 터진다(실제로 터졌다: "start byte index 5815 is not a char boundary").
+    // `<` 와 `>` 는 ASCII 라 그 자리에서 자르는 것은 안전하다.
+    let mut depth = 0i32;
+    let mut seen = 0u32;
+    let mut target: Option<(usize, usize)> = None; // 여는 태그의 (시작, 끝)
+    let b = sec.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'<' {
+            if b[i..].starts_with(b"<hp:subList") {
+                depth += 1;
+            } else if b[i..].starts_with(b"</hp:subList") {
+                depth -= 1;
+            } else if b[i..].starts_with(b"<hp:p ") || b[i..].starts_with(b"<hp:p>") {
+                if depth == 0 {
+                    if seen == para {
+                        let end = b[i..]
+                            .iter()
+                            .position(|c| *c == b'>')
+                            .map(|k| i + k)
+                            .unwrap_or(i);
+                        target = Some((i, end));
+                        break;
+                    }
+                    seen += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    let Some((tag_start, tag_end)) = target else {
+        bail!("구역 {section} 에 본문 단락 {para} 이 없습니다 (본문 단락 {seen}개)");
+    };
+
+    // ---- 2) 그 단락이 가리키는 paraPr
+    let tag = &sec[tag_start..tag_end];
+    let key = "paraPrIDRef=\"";
+    let Some(s) = tag.find(key) else {
+        bail!("구역 {section} 단락 {para} 에 `paraPrIDRef` 가 없습니다");
+    };
+    let s = s + key.len();
+    let Some(e) = tag[s..].find('"') else {
+        bail!("구역 {section} 단락 {para} 의 `paraPrIDRef` 를 읽을 수 없습니다");
+    };
+    let old_id = tag[s..s + e].to_string();
+
+    // ---- 3) 그 paraPr 을 베껴 정렬만 바꾼 새 것을 만든다
+    let hdr_name = "Contents/header.xml";
+    let Some(mut hdr) = pkg.text(hdr_name) else {
+        bail!("{hdr_name} 이 없습니다");
+    };
+    let open = format!("<hh:paraPr id=\"{old_id}\"");
+    let Some(ps) = hdr.find(&open) else {
+        bail!("`paraPr` {old_id} 를 {hdr_name} 에서 찾지 못했습니다");
+    };
+    let Some(pe) = hdr[ps..].find("</hh:paraPr>").map(|k| ps + k + "</hh:paraPr>".len()) else {
+        bail!("`paraPr` {old_id} 가 닫히지 않았습니다");
+    };
+    let base = hdr[ps..pe].to_string();
+
+    // 새 번호는 **지금 쓰이는 번호 중 가장 큰 것 + 1**
+    let mut max_id = 0u32;
+    let mut rest = hdr.as_str();
+    while let Some(at) = rest.find("<hh:paraPr id=\"") {
+        let s2 = at + "<hh:paraPr id=\"".len();
+        if let Some(e2) = rest[s2..].find('"') {
+            if let Ok(v) = rest[s2..s2 + e2].parse::<u32>() {
+                max_id = max_id.max(v);
+            }
+        }
+        rest = &rest[s2..];
+    }
+    let new_id = max_id + 1;
+
+    let (mut fresh, hits) = set_attr(&base, "<hh:align", "horizontal", horizontal, false);
+    if hits == 0 {
+        bail!("`paraPr` {old_id} 에 `hh:align/@horizontal` 이 없습니다");
+    }
+    let (f2, idh) = set_attr(&fresh, "<hh:paraPr", "id", &new_id.to_string(), false);
+    if idh == 0 {
+        bail!("새 `paraPr` 의 번호를 적지 못했습니다");
+    }
+    fresh = f2;
+
+    // 넣고 `itemCnt` 를 올린다 — 수가 안 맞으면 한글이 거부할 수 있다
+    hdr.insert_str(pe, &fresh);
+    let cnt_key = "<hh:paraProperties itemCnt=\"";
+    let Some(cs) = hdr.find(cnt_key) else {
+        bail!("`hh:paraProperties` 를 찾지 못했습니다");
+    };
+    let cs = cs + cnt_key.len();
+    let Some(ce) = hdr[cs..].find('"').map(|k| cs + k) else {
+        bail!("`itemCnt` 를 읽을 수 없습니다");
+    };
+    let cnt: u32 = hdr[cs..ce].parse().unwrap_or(0);
+    hdr.replace_range(cs..ce, &(cnt + 1).to_string());
+    pkg.set_text(hdr_name, hdr);
+
+    // ---- 4) 그 단락이 새 번호를 가리키게
+    let mut sec2 = sec.clone();
+    let abs = tag_start + s;
+    sec2.replace_range(abs..abs + e, &new_id.to_string());
+    pkg.set_text(&sec_name, sec2);
+    Ok(())
+}
+
 /// mm → HWPUNIT (1/7200 inch).
 pub fn mm_to_hwpunit(mm: f64) -> u32 {
     (mm * 7200.0 / 25.4).round().max(0.0) as u32

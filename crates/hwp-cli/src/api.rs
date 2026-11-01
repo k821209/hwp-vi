@@ -236,6 +236,17 @@ pub enum OpSpec {
         #[serde(default)]
         strike: Option<bool>,
     },
+    /// **문단 정렬을 바꾼다** — `justify|left|right|center|distribute|division`.
+    ///
+    /// 사용자 보고(hwp-vi#5)의 `set-para-style` 중 **정렬만** 먼저다. 들여쓰기는
+    /// 단위가 더 까다롭다 — HWP5 는 HWPUNIT 의 **절반** 단위로 저장하고
+    /// (실측), HWPX 는 `hp:switch` 안에 HWPUNIT 판과 글자 단위 판이 두 벌
+    /// 있다. 잘못 쓰면 2배로 틀리므로 그쪽은 따로 재고 낸다.
+    ///
+    /// **HWPX 만 된다.** 백엔드의 `apply-para-format` 을 못 믿어서(모르는 키를
+    /// 조용히 무시하고 값을 절반만 반영한다 — 실측) 우리가 XML 을 고치는데,
+    /// `.hwp`(CFB)는 작성기가 없다. `convert` 로 바꾼 뒤 고치면 된다.
+    SetParaAlign { section: u32, para: u32, align: String },
     /// 글머리 단계를 올리거나 내린다 (`Tab` / `Shift-Tab`)
     Relevel { section: u32, para: u32, delta: isize },
     /// **빈 표를 만든다** — 그 자리에 단락 하나가 함께 들어간다.
@@ -394,6 +405,13 @@ pub const CAPS: &[Cap] = &[
         id: "check-in-cell",
         what: "표 칸의 체크박스를 켜거나 끈다 — 좌표는 `checks` 가 준다",
         machine: Machine::Op("check-in-cell"),
+        ex: &[],
+    },
+    Cap {
+        id: "set-para-align",
+        what: "문단 정렬을 바꾼다 (justify|left|right|center|distribute|division) — \
+               **HWPX 만**. 좌표는 `styles` 가 준다",
+        machine: Machine::Op("set-para-align"),
         ex: &[],
     },
     Cap {
@@ -1329,6 +1347,7 @@ fn op_name(spec: &OpSpec) -> &'static str {
         OpSpec::Check { .. } => "check",
         OpSpec::CheckInCell { .. } => "check-in-cell",
         OpSpec::SetDeco { .. } => "set-deco",
+        OpSpec::SetParaAlign { .. } => "set-para-align",
         OpSpec::Relevel { .. } => "relevel",
         OpSpec::InsertTable { .. } => "insert-table",
         OpSpec::DeleteTable { .. } => "delete-table",
@@ -1700,6 +1719,23 @@ fn lower(
                 }],
                 Some(format!("표{index} 가 된다 ({rows}×{cols})")),
             )
+        }
+        OpSpec::SetParaAlign { section, para, align } => {
+            text_at(*section, *para)?;
+            use hwp_core::witness::ParaAlign;
+            let a = match align.trim().to_lowercase().as_str() {
+                "justify" => ParaAlign::Justify,
+                "left" => ParaAlign::Left,
+                "right" => ParaAlign::Right,
+                "center" => ParaAlign::Center,
+                "distribute" => ParaAlign::Distribute,
+                "division" => ParaAlign::Division,
+                other => anyhow::bail!(
+                    "모르는 정렬이다: {other:?} \
+                     (받는 것: justify, left, right, center, distribute, division)"
+                ),
+            };
+            (vec![Op::SetParaAlign { at: (*section, *para), align: a }], None)
         }
         OpSpec::SetDeco { section, para, offset, count, bold, italic, underline, strike } => {
             if strike.is_some() {
@@ -2472,6 +2508,8 @@ mod tests {
             paras: paras.iter().map(|&(s, p, t)| ((s, p), t.to_string())).collect(),
             cells: cells.iter().map(|&(tb, r, c, t)| ((tb, r, c), t.to_string())).collect(),
             drawings: drawings.iter().map(|&(s, p, n)| ((s, p), n)).collect(),
+            styles: Default::default(),
+            styles_checked: Default::default(),
             deco: Default::default(),
             deco_checked: Default::default(),
         }
