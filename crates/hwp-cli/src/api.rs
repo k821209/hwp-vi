@@ -112,7 +112,8 @@ fn yes() -> bool {
 /// 그래서 읽기를 하나 더하면 **두 군데를 고쳐야** 했고, 한쪽만 고치면 시험이
 /// "모르는 이름을 가리킨다" 로 깨진다(실제로 깨졌다).
 pub const READS: &[&str] = &[
-    "text", "outline", "tables", "styles", "deco", "images", "levels", "symbols", "checks", "all",
+    "text", "outline", "tables", "styles", "deco", "images", "levels", "symbols", "checks", "page",
+    "all",
 ];
 
 /// 편집 하나. 사람 쪽 키 하나하나에 대응한다.
@@ -362,6 +363,12 @@ pub const CAPS: &[Cap] = &[
         id: "check-in-cell",
         what: "표 칸의 체크박스를 켜거나 끈다 — 좌표는 `checks` 가 준다",
         machine: Machine::Op("check-in-cell"),
+        ex: &[],
+    },
+    Cap {
+        id: "read-page",
+        what: "쪽 설정 — 용지 크기와 여백 (mm 와 HWPUNIT 둘 다)",
+        machine: Machine::Read("page"),
         ex: &[],
     },
     Cap {
@@ -1025,6 +1032,38 @@ pub fn run(req: Request) -> Result<Value> {
         if want("symbols") {
             out.insert("symbols".into(), json!(symbols_json()));
         }
+        if want("page") {
+            // **쪽 설정** — 용지와 여백. 규격이 정해진 제출 문서에서 이 수가
+            // 서식 위반을 가른다(hwp-vi#4: "A4규격: 글자 13포인트 … 상하여백
+            // 15, 좌우여백 25"). 읽을 수 있어야 쓸 수 있다.
+            let t = Testimony::read(&target)?;
+            out.insert(
+                "page".into(),
+                match t.page {
+                    Some(g) => json!({
+                        "widthMm": round1(hwp_core::witness::PageSetup::mm(g.width)),
+                        "heightMm": round1(hwp_core::witness::PageSetup::mm(g.height)),
+                        "marginMm": {
+                            "left": round1(hwp_core::witness::PageSetup::mm(g.left)),
+                            "right": round1(hwp_core::witness::PageSetup::mm(g.right)),
+                            "top": round1(hwp_core::witness::PageSetup::mm(g.top)),
+                            "bottom": round1(hwp_core::witness::PageSetup::mm(g.bottom)),
+                            "header": round1(hwp_core::witness::PageSetup::mm(g.header)),
+                            "footer": round1(hwp_core::witness::PageSetup::mm(g.footer)),
+                            "gutter": round1(hwp_core::witness::PageSetup::mm(g.gutter)),
+                        },
+                        // 원시값도 같이 준다 — 쓰는 쪽은 HWPUNIT 으로 말한다
+                        "hwpunit": {
+                            "width": g.width, "height": g.height,
+                            "left": g.left, "right": g.right,
+                            "top": g.top, "bottom": g.bottom,
+                            "header": g.header, "footer": g.footer, "gutter": g.gutter,
+                        },
+                    }),
+                    None => Value::Null,
+                },
+            );
+        }
         if want("checks") {
             // 백엔드가 **편집으로 받는** 표 번호. `tables` 와 같은 출처다.
             let writable: BTreeSet<u32> = d
@@ -1255,6 +1294,11 @@ fn op_name(spec: &OpSpec) -> &'static str {
         OpSpec::DeleteTable { .. } => "delete-table",
         OpSpec::DeleteControl { .. } => "delete-control",
     }
+}
+
+/// mm 는 소수 한 자리까지. `20.000000000000004` 같은 수를 기계에 주지 않는다.
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
 }
 
 /// 그 자리에 체크박스가 있는가. **없으면 무엇이 있었는지 말한다** — 기계가
@@ -1900,6 +1944,9 @@ fn deco_json(t: &Testimony) -> Vec<Value> {
                         "italic": r.deco.italic,
                         "underline": r.deco.underline,
                         "strike": r.deco.strike,
+                        // **글자 크기**(pt). 서식을 우리 손으로 쓰려면 되읽어
+                        // 대조할 길이 먼저 있어야 한다. 0 이면 모르는 것이다.
+                        "sizePt": (r.size_100pt as f64) / 100.0,
                     })
                 })
                 .collect();

@@ -251,56 +251,187 @@ pub fn infer_column_width(observations: &[(usize, usize)]) -> Option<ColumnWidth
     Some(ColumnWidth { cells, narrowest, samples })
 }
 
-/// 표시 폭 `width` 칸에 맞춰 접는다. 공백에서 끊고, 끊을 곳이 없으면 글자에서 끊는다.
+/// 접은 줄 하나 — 글자와 **원문에서의 자리**.
+///
+/// 줄을 문자열로만 돌려주면 **버린 글자가 어디였는지 아무도 모른다.** 접는
+/// 쪽은 끊은 자리의 공백을 버리는데(표시로는 맞다), 커서를 놓는 쪽은 줄들의
+/// 글자 수가 원문과 같다고 가정하고 있었다. 실측: 4줄로 접힌 80자 단락의 줄
+/// 글자 합이 **77자** — 끊은 자리마다 하나씩. 그래서 커서가 지나온 접힘 수만큼
+/// 오른쪽으로 밀려 그려지고, 단락 끝 쪽 오프셋은 아예 못 찾아 마지막 줄의
+/// 0열로 떨어졌다.
+///
+/// 경계를 글자 오프셋으로 들고 다니면 그 가정이 필요 없어진다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    /// 이 줄에 그릴 글자
+    pub text: String,
+    /// 원문에서 이 줄이 시작하는 **글자** 번째
+    pub start: usize,
+    /// 이 줄이 담은 글자 수. **버린 공백·줄바꿈은 들어가지 않는다** —
+    /// 그래서 `start + len` 이 다음 줄의 `start` 와 다를 수 있고, 그 틈이
+    /// 바로 버린 글자다.
+    pub len: usize,
+}
+
+/// 표시 폭 `width` 칸에 맞춰 접는다. 공백에서 끊고, 끊을 곳이 없으면 글자에서
+/// 끊는다. **문단 안의 `'\n'`(강제 줄바꿈)에서도 끊는다.**
 ///
 /// 한글은 단어 사이 공백이 드물어 글자 단위 접힘이 기본이 된다 — 한글 조판이
 /// 원래 그렇게 동작한다.
-pub fn wrap(text: &str, width: usize) -> Vec<String> {
+pub fn wrap_spans(text: &str, width: usize) -> Vec<Span> {
+    let chars: Vec<char> = text.chars().collect();
+    let span = |s: usize, e: usize| Span {
+        text: chars[s..e].iter().collect(),
+        start: s,
+        len: e - s,
+    };
     if width == 0 {
-        return vec![text.to_string()];
+        return vec![span(0, chars.len())];
     }
-    let mut lines = Vec::new();
-    let mut line = String::new();
+    let mut out: Vec<Span> = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
     let mut line_w = 0usize;
-    // 마지막으로 본 공백의 (line 내 바이트 위치, 그 시점 폭)
-    let mut last_space: Option<(usize, usize)> = None;
+    // 이 줄 안에서 마지막으로 본 공백의 **글자** 번째
+    let mut last_space: Option<usize> = None;
 
-    for ch in text.chars() {
+    while i < chars.len() {
+        let ch = chars[i];
+        // **강제 줄바꿈에서 끊는다.** 문서가 거기서 줄을 바꾸라고 말한 것이다.
+        // 전에는 이 글자를 무시해서 `사업 기획- 현장문제` 처럼 붙어 보였다.
+        if ch == '\n' {
+            out.push(span(start, i));
+            i += 1;
+            start = i;
+            line_w = 0;
+            last_space = None;
+            continue;
+        }
         // **정책을 따르는 함수로 잰다.** 여기서 `unicode-width` 를 직접 부르면
         // 접는 폭만 좁은 기준으로 계산되고, 그린 칸은 넓은 기준이라 글자가
         // 옆 칸을 먹는다 — s03.hwpx 에서 `• 1,000,000원×25명(…` 이 27칸인데
         // 20칸 칸에 그대로 들어가 `|` 를 지웠다.
         let cw = char_width(ch);
-        if line_w + cw > width && !line.is_empty() {
+        if line_w + cw > width && i > start {
             match last_space {
-                // 공백에서 끊는다. 공백 자체는 버린다.
-                Some((byte, _)) if byte > 0 => {
-                    let rest = line[byte..].trim_start_matches(' ').to_string();
-                    line.truncate(byte);
-                    lines.push(std::mem::take(&mut line));
-                    line = rest;
-                    line_w = display_width(&line);
+                // 공백에서 끊는다. 공백 자체는 버린다 — 줄 끝에 남기면
+                // 복사할 때 따라간다.
+                Some(sp) if sp > start => {
+                    out.push(span(start, sp));
+                    let mut j = sp;
+                    while j < chars.len() && chars[j] == ' ' {
+                        j += 1;
+                    }
+                    start = j.min(i);
+                    line_w = chars[start..i].iter().map(|c| char_width(*c)).sum();
                 }
                 _ => {
-                    lines.push(std::mem::take(&mut line));
+                    out.push(span(start, i));
+                    start = i;
                     line_w = 0;
                 }
             }
             last_space = None;
         }
         if ch == ' ' {
-            last_space = Some((line.len(), line_w));
+            last_space = Some(i);
         }
-        line.push(ch);
         line_w += cw;
+        i += 1;
     }
-    lines.push(line);
-    lines
+    out.push(span(start, chars.len()));
+    out
+}
+
+/// 그릴 줄들만. 자리까지 필요하면 [`wrap_spans`].
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    wrap_spans(text, width).into_iter().map(|s| s.text).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **접은 줄은 원문의 그 자리를 가리켜야 한다.**
+    ///
+    /// 이 불변식이 깨지면 커서가 글자 위에 서지 않는다. 전에는 줄을 문자열로만
+    /// 돌려줘서 이것을 확인할 수가 없었고, 커서 쪽이 "줄들의 글자 수 합 =
+    /// 원문 길이" 라고 가정했다 — 접는 쪽이 끊은 자리의 공백을 버리므로 그
+    /// 가정이 틀렸다(실측: 4줄 77자 vs 원문 80자).
+    #[test]
+    fn 접은_줄은_원문의_그_자리를_가리킨다() {
+        let cases = [
+            " ○ 여름철 고온 대응 관수 기술을 적용한 노지 재배 안정성 향상 융합 과제의 세부 추진 계획과 연차별 목표",
+            "짧다",
+            "공백   이   여럿   있는   줄   을   접는다   그리고   더",
+            "강제\n줄바꿈\n이\n든\n단락",
+            "끝에 공백이 있다 ",
+            "",
+        ];
+        for text in cases {
+            let chars: Vec<char> = text.chars().collect();
+            for width in [1, 5, 12, 40, 200] {
+                let spans = wrap_spans(text, width);
+                // 1) 줄의 글자가 원문의 그 자리와 **같다**
+                for sp in &spans {
+                    let want: String = chars[sp.start..sp.start + sp.len].iter().collect();
+                    assert_eq!(
+                        sp.text, want,
+                        "폭 {width}, 자리 {}..{} 가 원문과 다르다 — {text:?}",
+                        sp.start,
+                        sp.start + sp.len
+                    );
+                }
+                // 2) 자리가 **앞으로만** 간다 (겹치지도, 거꾸로 가지도 않는다)
+                for w in spans.windows(2) {
+                    assert!(
+                        w[0].start + w[0].len <= w[1].start,
+                        "폭 {width}: 줄이 겹친다 {:?} / {:?} — {text:?}",
+                        w[0],
+                        w[1]
+                    );
+                }
+                // 3) 마지막 줄이 원문 끝까지 간다 — 뒤를 잘라먹지 않는다
+                if let Some(last) = spans.last() {
+                    assert_eq!(
+                        last.start + last.len,
+                        chars.len(),
+                        "폭 {width}: 마지막 줄이 원문 끝에 닿지 않는다 — {text:?}"
+                    );
+                }
+                // 4) 버린 글자는 **공백이나 줄바꿈뿐**이다. 글자를 잃지 않는다.
+                let mut covered = vec![false; chars.len()];
+                for sp in &spans {
+                    for c in covered[sp.start..sp.start + sp.len].iter_mut() {
+                        *c = true;
+                    }
+                }
+                for (i, &ok) in covered.iter().enumerate() {
+                    assert!(
+                        ok || chars[i] == ' ' || chars[i] == '\n',
+                        "폭 {width}: {}번째 글자 {:?} 를 잃었다 — {text:?}",
+                        i,
+                        chars[i]
+                    );
+                }
+                // 5) 그릴 줄만 뽑는 `wrap` 과 어긋나지 않는다
+                assert_eq!(
+                    wrap(text, width),
+                    spans.iter().map(|s| s.text.clone()).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// **강제 줄바꿈에서 줄을 바꾼다.** 문서가 거기서 바꾸라고 말한 것이다.
+    #[test]
+    fn 강제_줄바꿈에서_줄을_바꾼다() {
+        let lines = wrap("앞\n뒤", 100);
+        assert_eq!(lines, vec!["앞".to_string(), "뒤".to_string()], "{lines:?}");
+        // 접힘과 섞여도 된다
+        let both = wrap("가나다라마\n바사", 6);
+        assert_eq!(both, vec!["가나다".to_string(), "라마".to_string(), "바사".to_string()], "{both:?}");
+    }
 
     #[test]
     fn hangul_is_two_cells() {

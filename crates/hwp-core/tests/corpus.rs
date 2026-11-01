@@ -1878,9 +1878,15 @@ fn decoration_runs_stay_inside_their_paragraph() {
                         r.start
                     ));
                 }
-                if !r.deco.any() {
+                // **구간은 무엇이든 들고 있어야 한다** — 꾸밈이나 글자 크기.
+                //
+                // 전에는 `deco.any()` 만 요구했다. 구간이 꾸밈만 들던 때의
+                // 말이고, 지금은 **글자 크기**도 든다(쓰려면 먼저 읽어야
+                // 하므로 담기 시작했다). 요구의 뜻은 그대로다 — 아무것도
+                // 말하지 않는 구간을 내보내지 않는다.
+                if !r.deco.any() && r.size_100pt == 0 {
                     problems.push(format!(
-                        "{} 구역{} 단락{:?}: 꾸밈 없는 구간이 담겼다",
+                        "{} 구역{} 단락{:?}: 꾸밈도 크기도 없는 구간이 담겼다",
                         f.display(),
                         p.section,
                         p.index
@@ -4249,6 +4255,102 @@ fn a_create_preview_that_passes_means_the_save_will_pass() {
     let made = run(good, false);
     assert_eq!(made["ok"], true, "미리보기를 지났는데 저장이 깨졌다: {made}");
     assert!(dest.exists(), "저장했는데 파일이 없다");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **두 포맷이 글자 크기와 쪽 설정도 같게 읽어야 한다.**
+///
+/// 이 시험은 **자리를 확정한 그 측정을 관문으로 굳힌 것**이다. HWP5 쪽은
+/// 레코드의 바이트 자리를 알아야 읽을 수 있는데, 짐작하면 틀린다 — 이 세션에서
+/// 두 번 틀려 시험 넷을 깼다. 그래서 변환을 **측정 도구**로 썼다: 변환된
+/// HWPX 는 속성 이름이 분명하므로(`hh:charPr/@height`, `hp:pagePr`,
+/// `hp:margin`) 그 값과 맞는 자리를 찾아 확정했다.
+///
+/// 확정한 것:
+/// - `CHAR_SHAPE` 의 `[42..46]`(INT32) = 글자 크기, **1/100 pt**
+///   (s00.hwp 306개가 변환본의 `height` 와 순서까지 같다)
+/// - `PAGE_DEF`(태그 `BEGIN + 57`) 앞 9개 `UINT32` =
+///   width·height·left·right·top·bottom·header·footer·gutter, **HWPUNIT**
+///   (s00.hwp: 59528 84188 5669 5669 3500 2834 3000 1354 0)
+///
+/// **왜 읽기부터인가.** 서식을 우리 손으로 쓰려면(백엔드가 안 받는 것들) 쓴
+/// 것을 되읽어 대조할 길이 먼저 있어야 한다. 읽지 못하는 것은 쓰지 않는다.
+#[test]
+fn the_two_formats_agree_on_char_size_and_page_setup() {
+    let Some((rhwp, _)) = backend() else { return };
+    let files: Vec<PathBuf> = samples()
+        .into_iter()
+        .filter(|f| f.extension().and_then(|s| s.to_str()) == Some("hwp"))
+        .collect();
+    if files.is_empty() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-size-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    let mut checked = 0usize;
+    let mut sizes_seen = 0usize;
+    for src in &files {
+        let out = dir.join(format!(
+            "{}.hwpx",
+            src.file_stem().and_then(|s| s.to_str()).unwrap_or("x")
+        ));
+        let (sp, op) = (src.display().to_string(), out.display().to_string());
+        if rhwp.run(&["export-hwpx", &sp, &op]).is_err() || !out.is_file() {
+            continue;
+        }
+        let a = Testimony::read(src).expect("증인 hwp");
+        let b = Testimony::read(&out).expect("증인 hwpx");
+
+        // ---- 쪽 설정
+        assert_eq!(
+            a.page,
+            b.page,
+            "{} 의 쪽 설정이 포맷에 따라 다르다",
+            src.display()
+        );
+        let page = a.page.expect("쪽 설정을 읽지 못했다");
+        assert!(
+            page.width > 0 && page.height > 0,
+            "{} 의 용지 크기가 0 이다",
+            src.display()
+        );
+
+        // ---- 글자 크기: 단락마다 구간의 크기 목록이 같아야 한다
+        let sizes = |t: &Testimony| -> BTreeMap<(u32, u32), Vec<u32>> {
+            t.body_paragraphs()
+                .into_iter()
+                .filter_map(|p| {
+                    p.index
+                        .map(|i| ((p.section, i), p.runs.iter().map(|r| r.size_100pt).collect()))
+                })
+                .collect()
+        };
+        let (sa, sb) = (sizes(&a), sizes(&b));
+        for (k, want) in &sa {
+            sizes_seen += want.iter().filter(|s| **s > 0).count();
+            assert_eq!(
+                sb.get(k),
+                Some(want),
+                "{} 구역{} 단락{} 의 글자 크기가 포맷에 따라 다르다",
+                src.display(),
+                k.0,
+                k.1
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "변환에 성공한 문서가 없다 — 이 시험이 아무것도 보지 않았다");
+    // **본 것이 있는지 확인한다.** 크기가 전부 0 이면 통과해도 뜻이 없다.
+    //
+    // 문턱은 "읽는 쪽이 살아 있는가" 를 보는 것이고, 대조 자체는 **단락
+    // 전부**에 걸린다. 처음에 50 으로 뒀다가 합성 코퍼스에서 깨졌다(12개) —
+    // 그건 실무 코퍼스의 수였고, 재던 것(살아 있는가)보다 센 기준이었다.
+    assert!(
+        sizes_seen > 5,
+        "글자 크기를 {sizes_seen}개만 봤다 — 읽는 쪽이 죽었다"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

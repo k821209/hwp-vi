@@ -425,23 +425,34 @@ impl Buffer {
     }
 
     /// 커서 오프셋이 접힌 줄의 몇 번째 줄, 몇 칸인지.
+    ///
+    /// **접은 줄의 자리를 받아 쓴다**(`wrap_spans`). 전에는 줄들의 글자 수를
+    /// 더해 가며 찾았는데, 접는 쪽이 끊은 자리의 공백을 **버리므로** 그 합이
+    /// 원문보다 짧다(실측: 4줄 77자 vs 원문 80자). 그래서 커서가 지나온 접힘
+    /// 수만큼 오른쪽으로 밀렸고, 단락 끝 쪽 오프셋은 아예 못 찾아 마지막 줄의
+    /// 0열로 떨어졌다.
     pub fn cursor_screen(&self, width: usize) -> (usize, usize) {
-        let lines = self.wrapped(self.cursor.at, width);
-        let mut seen = 0usize;
-        for (row, line) in lines.iter().enumerate() {
-            let n = line.chars().count();
-            if self.cursor.offset <= seen + n {
-                let col = self.cursor.offset - seen;
-                let cells: usize = line
+        let spans = hwp_core::wrap::wrap_spans(self.text_at(self.cursor.at), width.max(1));
+        let off = self.cursor.offset;
+        let mut last = (0usize, 0usize);
+        for (row, sp) in spans.iter().enumerate() {
+            // **버린 글자 자리**(끊긴 공백이나 강제 줄바꿈)에 커서가 있으면
+            // 그 글자는 어느 줄에도 그려지지 않는다 — 앞 줄의 끝에 둔다.
+            if off < sp.start {
+                return last;
+            }
+            if off <= sp.start + sp.len {
+                let cells: usize = sp
+                    .text
                     .chars()
-                    .take(col)
+                    .take(off - sp.start)
                     .map(|c| hwp_core::wrap::display_width(&c.to_string()))
                     .sum();
                 return (row, cells);
             }
-            seen += n;
+            last = (row, hwp_core::wrap::display_width(&sp.text));
         }
-        (lines.len().saturating_sub(1), 0)
+        last
     }
 
     // ---- 이동 ----
@@ -1028,6 +1039,66 @@ mod tests {
                 ],
             }],
         }.with_paras_from_blocks()
+    }
+
+    /// **접힌 단락에서 커서가 글자 위에 서야 한다.**
+    ///
+    /// 전에는 접은 줄들의 글자 수를 더해 가며 찾았는데, 접는 쪽이 끊은 자리의
+    /// 공백을 **버리므로** 그 합이 원문보다 짧다(실측: 4줄 77자 vs 원문 80자).
+    /// 그래서 커서가 지나온 접힘 수만큼 오른쪽으로 밀리고, 단락 끝 쪽 오프셋은
+    /// 아예 못 찾아 **마지막 줄의 0열로 떨어졌다** — 뒤로 갈수록 커서가
+    /// 앞으로 되돌아가는 꼴이다.
+    #[test]
+    fn 접힌_단락에서_커서가_글자_위에_선다() {
+        let text = " ○ 여름철 고온 대응 관수 기술을 적용한 노지 재배 안정성 향상 융합 과제의 세부 추진 계획과 연차별 목표";
+        let mut d = doc();
+        d.paras.insert((0, 0), text.to_string());
+        let mut b = Buffer::from_doc(&d);
+        b.cursor.at = (0, 0);
+
+        let width = 40usize;
+        let spans = hwp_core::wrap::wrap_spans(text, width);
+        assert!(spans.len() >= 3, "이 시험은 접히는 단락이어야 뜻이 있다");
+
+        let n = text.chars().count();
+        let mut prev: Option<(usize, usize)> = None;
+        for off in 0..=n {
+            b.cursor.offset = off;
+            let (row, cells) = b.cursor_screen(width);
+            assert!(row < spans.len(), "오프셋 {off}: 없는 줄 {row} 을 가리킨다");
+            // **앞으로만 간다.** 오프셋이 커지면 (줄, 칸) 도 커져야 한다 —
+            // 되돌아가는 것이 옛 결함의 증상이었다.
+            if let Some(p) = prev {
+                assert!(
+                    (row, cells) >= p,
+                    "오프셋 {off}: 커서가 되돌아갔다 {p:?} → {:?}",
+                    (row, cells)
+                );
+            }
+            prev = Some((row, cells));
+            // **그 자리에 그려지는 글자가 그 오프셋의 글자여야 한다.**
+            // (버린 글자 자리는 앞 줄 끝에 놓이므로 건너뛴다)
+            let sp = &spans[row];
+            if off >= sp.start && off < sp.start + sp.len {
+                let drawn: usize = sp
+                    .text
+                    .chars()
+                    .take(off - sp.start)
+                    .map(|c| hwp_core::wrap::display_width(&c.to_string()))
+                    .sum();
+                assert_eq!(cells, drawn, "오프셋 {off}: 칸이 어긋난다");
+            }
+        }
+
+        // **마지막 글자는 마지막 줄에 있다.** 전에는 여기서 0열로 떨어졌다.
+        b.cursor.offset = n;
+        let (row, cells) = b.cursor_screen(width);
+        assert_eq!(row, spans.len() - 1, "단락 끝이 마지막 줄이 아니다");
+        assert_eq!(
+            cells,
+            hwp_core::wrap::display_width(&spans[spans.len() - 1].text),
+            "단락 끝이 마지막 줄의 끝이 아니다"
+        );
     }
 
     #[test]

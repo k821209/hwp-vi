@@ -64,6 +64,8 @@ pub struct Testimony {
     pub paragraphs: Vec<Para>,
     /// 표 — 셀 좌표까지. 셀 편집을 독립 검증하려면 좌표가 있어야 한다.
     pub tables: Vec<WitnessTable>,
+    /// 첫 구역의 쪽 설정. 없으면 `None`.
+    pub page: Option<PageSetup>,
 }
 
 /// 단락 하나.
@@ -178,7 +180,12 @@ fn tidy_runs(mut runs: Vec<Run>, text: &str) -> Vec<Run> {
     let chars: Vec<char> = text.chars().collect();
     runs.retain(|r| {
         let end = (r.start + r.len).min(chars.len());
-        r.deco.any()
+        // **꾸밈이 없어도 크기가 있으면 담는다.**
+        //
+        // 전에는 `deco.any()` 만 봤다. 그러면 "13pt 로 썼다" 를 되읽을 수가
+        // 없다 — 서식을 우리 손으로 쓰려면 먼저 읽을 수 있어야 하고, 그게
+        // 이 변경의 목적이다.
+        (r.deco.any() || r.size_100pt > 0)
             && r.len > 0
             && r.start < chars.len()
             // 보이는 글자가 하나라도 있어야 한다 (컨트롤만이면 버린다)
@@ -188,7 +195,13 @@ fn tidy_runs(mut runs: Vec<Run>, text: &str) -> Vec<Run> {
     let mut out: Vec<Run> = Vec::new();
     for r in runs {
         match out.last_mut() {
-            Some(prev) if prev.deco == r.deco && prev.start + prev.len >= r.start => {
+            // **크기도 같아야 합친다.** 꾸밈만 보면 12pt 와 13pt 구간이
+            // 한 구간으로 뭉개진다.
+            Some(prev)
+                if prev.deco == r.deco
+                    && prev.size_100pt == r.size_100pt
+                    && prev.start + prev.len >= r.start =>
+            {
                 let end = (r.start + r.len).max(prev.start + prev.len);
                 prev.len = end - prev.start;
             }
@@ -209,6 +222,47 @@ pub struct Run {
     pub start: usize,
     pub len: usize,
     pub deco: Deco,
+    /// 글자 크기, **1/100 pt**. 13pt 면 `1300`. 모르면 0.
+    ///
+    /// 읽을 수 있어야 쓸 수 있다 — 서식을 우리 손으로 쓰려면 되읽어 대조할
+    /// 길이 먼저 있어야 한다. 자리는 **변환을 측정 도구로 써서** 확정했다:
+    /// HWP5 `CHAR_SHAPE` 의 `[42..46]`(INT32) 가 변환된 HWPX 의
+    /// `hh:charPr/@height` 와 306개 전부 순서까지 같다.
+    pub size_100pt: u32,
+}
+
+/// 글자서식 표의 한 항목 — 꾸밈과 크기.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CharShape {
+    pub deco: Deco,
+    /// 1/100 pt
+    pub size_100pt: u32,
+}
+
+/// 쪽 설정 — 용지와 여백. 단위는 **HWPUNIT**(1/7200 inch).
+///
+/// 자리를 짐작하지 않고 **변환으로 확정**했다. HWP5 `PAGE_DEF`(태그
+/// `HWPTAG_BEGIN + 57`)의 앞 9개 `UINT32` 가 변환된 HWPX 의 `hp:pagePr`·
+/// `hp:margin` 과 정확히 같다(s00.hwp: 59528 84188 5669 5669 3500 2834 3000
+/// 1354 0).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageSetup {
+    pub width: u32,
+    pub height: u32,
+    pub left: u32,
+    pub right: u32,
+    pub top: u32,
+    pub bottom: u32,
+    pub header: u32,
+    pub footer: u32,
+    pub gutter: u32,
+}
+
+impl PageSetup {
+    /// mm 로. 1 mm = 7200/25.4 HWPUNIT.
+    pub fn mm(v: u32) -> f64 {
+        v as f64 * 25.4 / 7200.0
+    }
 }
 
 /// 문단서식에서 화면에 옮길 수 있는 것만.
@@ -470,7 +524,7 @@ impl Testimony {
             para_shapes(&plain)
         };
         // 글자서식 표도 같은 스트림에서
-        let char_decos: Vec<Deco> = {
+        let char_decos: Vec<CharShape> = {
             let mut raw = Vec::new();
             comp.open_stream("/DocInfo")
                 .context("DocInfo 스트림이 없다")?
@@ -506,14 +560,20 @@ impl Testimony {
 
         let mut tables = Vec::new();
         let mut next_index = 0u32;
+        // 쪽 설정은 **첫 구역**의 것을 쓴다 — 구역마다 다를 수 있지만 쓰기
+        // 쪽에서 가리킬 좌표가 아직 없다. 늘리려면 구역별로 모은다.
+        let mut page = None;
         for s in &sections {
             let mut raw = Vec::new();
             comp.open_stream(format!("/{s}"))?.read_to_end(&mut raw)?;
             let plain = if compressed { inflate_raw(&raw)? } else { raw };
+            if page.is_none() {
+                page = page_setup_hwp5(&plain);
+            }
             tables.extend(tables_from_records(&plain, &mut next_index, &shapes));
         }
 
-        Ok(Self { container: Container::Cfb, parts, paragraphs, tables })
+        Ok(Self { container: Container::Cfb, parts, paragraphs, tables, page })
     }
 
     // ---- HWPX (ZIP + OWPML) ----
@@ -566,13 +626,17 @@ impl Testimony {
 
         let mut tables = Vec::new();
         let mut next_index = 0u32;
+        let mut page = None;
         for s in &sections {
             let mut xml = String::new();
             zip.by_name(s)?.read_to_string(&mut xml)?;
+            if page.is_none() {
+                page = page_setup_owpml(&xml);
+            }
             tables.extend(tables_from_owpml(&xml, &mut next_index, &styles)?);
         }
 
-        Ok(Self { container: Container::Zip, parts, paragraphs, tables })
+        Ok(Self { container: Container::Zip, parts, paragraphs, tables, page })
     }
 }
 
@@ -876,16 +940,73 @@ const HWPTAG_CHAR_SHAPE: u32 = HWPTAG_BEGIN + 5;
 const HWPTAG_PARA_CHAR_SHAPE: u32 = HWPTAG_BEGIN + 52;
 
 /// `DocInfo` 의 글자서식 표 — `PARA_CHAR_SHAPE` 의 번호가 이 배열을 가리킨다.
-fn char_shapes(doc_info: &[u8]) -> Vec<Deco> {
+fn char_shapes(doc_info: &[u8]) -> Vec<CharShape> {
     collect_records(doc_info)
         .into_iter()
         .filter(|(tag, _, payload)| *tag == HWPTAG_CHAR_SHAPE && payload.len() >= 50)
         .map(|(_, _, payload)| {
-            let attr =
-                u32::from_le_bytes([payload[46], payload[47], payload[48], payload[49]]);
-            Deco::from_bits(attr)
+            // `[42..46]` baseSize (INT32, 1/100 pt) · `[46..50]` 속성
+            //
+            // 레이아웃이 맞아떨어진다: faceNameIds 7×2 + ratios 7 + spacings 7
+            // + relSizes 7 + offsets 7 = 42. 그리고 **변환으로 확인했다** —
+            // 변환된 HWPX 의 `hh:charPr/@height` 306개와 순서까지 같다.
+            let size = i32::from_le_bytes([payload[42], payload[43], payload[44], payload[45]]);
+            let attr = u32::from_le_bytes([payload[46], payload[47], payload[48], payload[49]]);
+            CharShape {
+                deco: Deco::from_bits(attr),
+                size_100pt: size.max(0) as u32,
+            }
         })
         .collect()
+}
+
+/// HWP5 `PAGE_DEF` — 용지와 여백.
+fn page_setup_hwp5(section: &[u8]) -> Option<PageSetup> {
+    collect_records(section)
+        .into_iter()
+        .find(|(tag, _, pl)| *tag == HWPTAG_PAGE_DEF && pl.len() >= 36)
+        .map(|(_, _, pl)| {
+            let u = |i: usize| u32::from_le_bytes([pl[i], pl[i + 1], pl[i + 2], pl[i + 3]]);
+            PageSetup {
+                width: u(0),
+                height: u(4),
+                left: u(8),
+                right: u(12),
+                top: u(16),
+                bottom: u(20),
+                header: u(24),
+                footer: u(28),
+                gutter: u(32),
+            }
+        })
+}
+
+/// OWPML 의 쪽 설정 — `hp:pagePr`(용지)와 `hp:margin`(여백).
+///
+/// 두 엘리먼트 다 구역 설정에 한 번 나오므로 처음 것을 쓴다. 속성 이름이
+/// 분명해서 HWP5 쪽 자리를 **이 값으로 확정했다**(s00.hwp: 양쪽이
+/// 59528 84188 5669 5669 3500 2834 3000 1354 0 으로 같다).
+fn page_setup_owpml(xml: &str) -> Option<PageSetup> {
+    let num = |tag: &str, key: &str| -> Option<u32> {
+        let at = xml.find(tag)?;
+        let end = xml[at..].find('>')? + at;
+        let seg = &xml[at..end];
+        let k = format!("{key}=\"");
+        let s = seg.find(&k)? + k.len();
+        let e = seg[s..].find('"')? + s;
+        seg[s..e].parse().ok()
+    };
+    Some(PageSetup {
+        width: num("<hp:pagePr", "width")?,
+        height: num("<hp:pagePr", "height")?,
+        left: num("<hp:margin", "left").unwrap_or(0),
+        right: num("<hp:margin", "right").unwrap_or(0),
+        top: num("<hp:margin", "top").unwrap_or(0),
+        bottom: num("<hp:margin", "bottom").unwrap_or(0),
+        header: num("<hp:margin", "header").unwrap_or(0),
+        footer: num("<hp:margin", "footer").unwrap_or(0),
+        gutter: num("<hp:margin", "gutter").unwrap_or(0),
+    })
 }
 
 /// `DocInfo` 의 문단서식 표. `PARA_HEADER` 의 `paraShapeId` 가 이 배열을 가리킨다.
@@ -923,6 +1044,7 @@ fn para_shapes(doc_info: &[u8]) -> Vec<ParaStyle> {
 }
 const HWPTAG_PARA_TEXT: u32 = HWPTAG_BEGIN + 51;
 const HWPTAG_LIST_HEADER: u32 = HWPTAG_BEGIN + 56;
+const HWPTAG_PAGE_DEF: u32 = HWPTAG_BEGIN + 57;
 const HWPTAG_TABLE: u32 = HWPTAG_BEGIN + 61;
 
 /// 태그 레코드 스트림을 훑어 단락을 센다.
@@ -930,7 +1052,7 @@ const HWPTAG_TABLE: u32 = HWPTAG_BEGIN + 61;
 /// `PARA_HEADER` 가 단락의 시작이고 레코드 헤더의 `level` 이 중첩 깊이다.
 /// `PARA_TEXT` 는 바로 앞 단락의 본문이며, 빈 단락에는 아예 없다 — 그래서
 /// `PARA_TEXT` 를 세면 빈 단락을 놓친다. rhwp 좌표와 어긋나는 원인이 이것이었다.
-fn paras_from_records(buf: &[u8], shapes: &[ParaStyle], chars: &[Deco]) -> Vec<Para> {
+fn paras_from_records(buf: &[u8], shapes: &[ParaStyle], chars: &[CharShape]) -> Vec<Para> {
     let mut out: Vec<Para> = Vec::new();
     // 방금 읽은 `PARA_TEXT` 의 보이는 글자별 원시 wchar 위치. 바로 뒤에 오는
     // `PARA_CHAR_SHAPE` 가 이걸로 구간을 옮긴다.
@@ -1182,10 +1304,10 @@ fn raw_positions(payload: &[u8]) -> Vec<usize> {
 ///
 /// 꾸밈이 없는 구간만 나오면 빈 목록을 돌려준다 — 23%만 꾸밈이 있으므로
 /// 대부분의 단락에서 아무것도 들고 있지 않는 것이 맞다.
-fn runs_from_char_shape(payload: &[u8], raw_pos: &[usize], shapes: &[Deco]) -> Vec<Run> {
+fn runs_from_char_shape(payload: &[u8], raw_pos: &[usize], shapes: &[CharShape]) -> Vec<Run> {
     let n = payload.len() / 8;
     let visible = raw_pos.len();
-    let mut marks: Vec<(usize, Deco)> = Vec::with_capacity(n);
+    let mut marks: Vec<(usize, CharShape)> = Vec::with_capacity(n);
     for k in 0..n {
         let at = k * 8;
         let pos = u32::from_le_bytes([
@@ -1202,18 +1324,26 @@ fn runs_from_char_shape(payload: &[u8], raw_pos: &[usize], shapes: &[Deco]) -> V
         ]) as usize;
         // 원시 위치 → 보이는 글자 번째. 그 자리 이전의 보이는 글자 수다.
         let start = raw_pos.partition_point(|r| *r < pos);
-        let deco = shapes.get(id).copied().unwrap_or_default();
-        marks.push((start.min(visible), deco));
+        let shape = shapes.get(id).copied().unwrap_or_default();
+        marks.push((start.min(visible), shape));
     }
     marks.dedup_by(|a, b| a.1 == b.1);
 
     let mut out = Vec::new();
-    for (i, (start, deco)) in marks.iter().enumerate() {
+    for (i, (start, shape)) in marks.iter().enumerate() {
         let end = marks.get(i + 1).map(|(s, _)| *s).unwrap_or(visible);
-        if !deco.any() || end <= *start {
+        if end <= *start {
             continue;
         }
-        out.push(Run { start: *start, len: end - *start, deco: *deco });
+        // **크기만 다른 구간도 담는다.** 전에는 꾸밈이 없으면 버렸는데
+        // (`!deco.any()`), 그러면 "13pt 로 썼다" 를 되읽을 수가 없다 —
+        // 쓰려면 읽을 수 있어야 한다. 버리는 조건은 `tidy_runs` 가 쥔다.
+        out.push(Run {
+            start: *start,
+            len: end - *start,
+            deco: shape.deco,
+            size_100pt: shape.size_100pt,
+        });
     }
     out
 }
@@ -1235,15 +1365,16 @@ fn runs_from_char_shape(payload: &[u8], raw_pos: &[usize], shapes: &[Deco]) -> V
 ///
 /// HWP5 와 달리 **여기 값은 이미 HWPUNIT 이다** — 나누지 않는다.
 /// HWPX `header.xml` 의 글자서식 표 — `charPrIDRef` → [`Deco`].
-fn char_decos_from_header(xml: &str) -> HashMap<String, Deco> {
+fn char_decos_from_header(xml: &str) -> HashMap<String, CharShape> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
 
     let mut reader = Reader::from_str(xml);
-    let mut out: HashMap<String, Deco> = HashMap::new();
+    let mut out: HashMap<String, CharShape> = HashMap::new();
     let mut open: Option<String> = None;
     let (mut bold, mut italic) = (false, false);
     let (mut underline, mut strike) = (String::new(), String::new());
+    let mut height = 0u32;
 
     let attr = |e: &quick_xml::events::BytesStart, name: &str| -> Option<String> {
         e.attributes()
@@ -1266,6 +1397,8 @@ fn char_decos_from_header(xml: &str) -> HashMap<String, Deco> {
                     italic = false;
                     underline.clear();
                     strike.clear();
+                    // 글자 크기는 `hh:charPr` 의 속성이다 (1/100 pt)
+                    height = attr(e, "height").and_then(|h| h.parse().ok()).unwrap_or(0);
                 }
                 "hh:bold" if open.is_some() => bold = true,
                 "hh:italic" if open.is_some() => italic = true,
@@ -1281,7 +1414,13 @@ fn char_decos_from_header(xml: &str) -> HashMap<String, Deco> {
             Event::End(e) => {
                 if e.name().as_ref() == "hh:charPr" {
                     if let Some(id) = open.take() {
-                        out.insert(id, Deco::from_owpml(bold, italic, &underline, &strike));
+                        out.insert(
+                            id,
+                            CharShape {
+                                deco: Deco::from_owpml(bold, italic, &underline, &strike),
+                                size_100pt: height,
+                            },
+                        );
                     }
                 }
             }
@@ -1384,7 +1523,7 @@ fn para_styles_from_header(xml: &str) -> HashMap<String, ParaStyle> {
 fn paras_from_owpml(
     xml: &str,
     styles: &HashMap<String, ParaStyle>,
-    decos: &HashMap<String, Deco>,
+    decos: &HashMap<String, CharShape>,
 ) -> Result<Vec<Para>> {
     use quick_xml::escape::unescape;
     use quick_xml::events::Event;
@@ -1431,7 +1570,7 @@ fn paras_from_owpml(
                     // 꾸밈 구간의 시작 — 지금까지 담긴 글자 수가 그 자리다
                     "hp:run" => {
                         if let Some(&i) = open_paras.last() {
-                            let deco = e
+                            let shape = e
                                 .attributes()
                                 .flatten()
                                 .find(|a| a.key.as_ref() == "charPrIDRef")
@@ -1443,7 +1582,12 @@ fn paras_from_owpml(
                             if let Some(last) = paras[i].runs.last_mut() {
                                 last.len = start.saturating_sub(last.start);
                             }
-                            paras[i].runs.push(Run { start, len: 0, deco });
+                            paras[i].runs.push(Run {
+                                start,
+                                len: 0,
+                                deco: shape.deco,
+                                size_100pt: shape.size_100pt,
+                            });
                         }
                     }
                     other if is_owpml_drawing(other) => {
