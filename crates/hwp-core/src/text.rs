@@ -321,6 +321,8 @@ impl TextFile {
             ops_applied: log.len(),
             paragraphs: want.len(),
             cells: 0,
+            // 텍스트 파일 경로는 백엔드를 쓰지 않는다 — 올 말이 없다.
+            notes: Vec::new(),
         })
     }
 }

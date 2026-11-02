@@ -492,6 +492,13 @@ pub struct SaveReport {
     pub paragraphs: usize,
     /// 증인이 확인한 표 셀 수
     pub cells: usize,
+    /// **백엔드가 성공하면서 말한 것.** 막지는 않지만 알아야 할 것들.
+    ///
+    /// `Rhwp::run` 은 성공 시 stderr 를 버린다. 그런데 백엔드는 성공하면서
+    /// "무엇을 담을 수 없었다" 를 그쪽으로 말한다 — 버리면 주 쓰기 경로가
+    /// 조용해진다. 실측: `.hwpx`→`.hwp` 에서 필드 파라미터가 사라지는데
+    /// 우리는 성공만 보고하고 있었다.
+    pub notes: Vec<String>,
 }
 
 /// 그리기개체(표·그림·글상자). 구역정의(2)·쪽번호(21)·머리말(16)은 **본문에
@@ -709,6 +716,7 @@ pub fn save_as(rhwp: &Rhwp, src: &Path, dest: &Path, log: &EditLog) -> Result<Sa
             ops_applied: 0,
             paragraphs: snap.paras.len(),
             cells: snap.cells.len(),
+            notes: Vec::new(),
         }
     } else {
         // 임시본에서 평소의 자가검증 저장을 돌린다. 실패하면 `_guard` 가
@@ -1069,7 +1077,12 @@ fn shift<V>(map: BTreeMap<Coord, V>, section: u32, from: u32, delta: i64) -> BTr
 }
 
 /// 연산을 rhwp 에 재생해 새 파일을 만든다. 중간 파일은 임시 디렉터리에 둔다.
-fn replay(rhwp: &Rhwp, src: &Path, ops: &[Op], workdir: &Path) -> Result<PathBuf> {
+fn replay(
+    rhwp: &Rhwp,
+    src: &Path,
+    ops: &[Op],
+    workdir: &Path,
+) -> Result<(PathBuf, Vec<String>)> {
     let ext = src
         .extension()
         .and_then(|s| s.to_str())
@@ -1081,6 +1094,7 @@ fn replay(rhwp: &Rhwp, src: &Path, ops: &[Op], workdir: &Path) -> Result<PathBuf
     // 연산 하나가 백엔드 명령 **여러 개**로 펴질 수 있다(여러 문단 칸).
     // 그래서 중간 산출물에 명령 번호까지 붙여 사슬로 잇는다.
     let mut step = 0usize;
+    let mut notes: Vec<String> = Vec::new();
     for (n, op) in ops.iter().enumerate() {
         // **우리가 직접 하는 연산.** 백엔드를 거치지 않고 다음 단계 파일을 만든다.
         // 그래도 뒤의 대조는 똑같이 지난다 — 쓰는 쪽이 누구든 되읽어 확인한다.
@@ -1104,9 +1118,15 @@ fn replay(rhwp: &Rhwp, src: &Path, ops: &[Op], workdir: &Path) -> Result<PathBuf
             let cmds = op.commands(&input.to_string_lossy(), &output.to_string_lossy());
             let args = &cmds[k];
             let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            rhwp.run(&refs).with_context(|| {
+            // **백엔드가 성공하면서 말한 손실도 모은다.** `run` 은 성공 시
+            // stderr 를 버리는데, 백엔드는 성공하면서 "무엇을 담을 수 없었다"
+            // 를 그쪽으로 말한다(실측). 버리면 주 쓰기 경로가 조용해진다.
+            let (_, mut said) = rhwp.run_with_notes(&refs).with_context(|| {
                 format!("{} 번째 연산 실패 ({}/{}) — {}", n + 1, k + 1, cmds.len(), op.describe())
             })?;
+            for s in said.drain(..) {
+                notes.push(format!("{} — {s}", op.describe()));
+            }
             if !output.exists() {
                 bail!(
                     "{} 번째 연산이 출력을 내지 않았습니다 ({}/{}) — {}",
@@ -1119,7 +1139,7 @@ fn replay(rhwp: &Rhwp, src: &Path, ops: &[Op], workdir: &Path) -> Result<PathBuf
             input = output;
         }
     }
-    Ok(input)
+    Ok((input, notes))
 }
 
 /// 기대와 실제가 어떻게 다른가. 저장을 멈출 때 사람에게 보여 줄 말.
@@ -1269,7 +1289,7 @@ pub fn save(rhwp: &Rhwp, path: &Path, log: &EditLog) -> Result<SaveReport> {
 
     let workdir = tempdir_for(path)?;
     let result = replay(rhwp, path, log.ops(), &workdir);
-    let staged = match result {
+    let (staged, notes) = match result {
         Ok(p) => p,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&workdir);
@@ -1332,6 +1352,7 @@ pub fn save(rhwp: &Rhwp, path: &Path, log: &EditLog) -> Result<SaveReport> {
         ops_applied: log.len(),
         paragraphs: got.paras.len(),
         cells: got.cells.len(),
+        notes,
     })
 }
 

@@ -48,6 +48,7 @@ fn corpus_is_synthetic() -> bool {
 const REAL_CORPUS_ONLY: &[&str] = &[
     "a_drawn_table_keeps_the_column_proportions_of_the_document",
     "character_decoration_agrees_across_the_two_formats",
+    "every_loss_the_backend_announces_reaches_the_caller",
     "the_two_formats_read_the_same_text_including_forced_line_breaks",
     "column_width_is_measured_for_real_documents",
     "decoration_runs_stay_inside_their_paragraph",
@@ -4667,6 +4668,73 @@ fn changing_one_paragraphs_alignment_does_not_spread_to_others() {
     assert!(
         msg.contains("HWPX") && msg.contains("convert"),
         "거부만 하고 갈 곳을 말하지 않는다: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **백엔드가 성공하면서 말한 손실은 부르는 쪽까지 가야 한다.**
+///
+/// `Rhwp::run` 은 성공했을 때 stderr 를 버렸다. 그런데 백엔드는 **성공하면서**
+/// 무엇을 담을 수 없었는지 그쪽으로 말한다 — 실측(`.hwpx` → `.hwp`):
+///
+/// ```text
+/// [hwp5] 필드(Formula) 파라미터 4개 손실 — HWP5 CTRL_DATA에 규정된 슬롯 없음
+/// ```
+///
+/// 그걸 버리면 `hwp convert` 가 "바꿨습니다" 만 말하고 **무엇을 잃었는지 아무도
+/// 모른다.** 실제로 그렇게 동작하고 있었다 — 이 저장소의 기준에 정면으로
+/// 걸리는 자리를 우리가 들고 있었다.
+///
+/// 이 시험은 **백엔드가 말한 줄이 우리 보고에 다 있는지** 본다. 실무 문서
+/// 전용이다: 합성 코퍼스에는 누름틀·수식·하이퍼링크가 없어서 백엔드가 할 말이
+/// 없다(그러면 통과해도 뜻이 없다).
+#[test]
+fn every_loss_the_backend_announces_reaches_the_caller() {
+    if !needs_real_corpus("every_loss_the_backend_announces_reaches_the_caller") {
+        return;
+    }
+    let Some((rhwp, _)) = backend() else { return };
+    let files: Vec<PathBuf> = samples()
+        .into_iter()
+        .filter(|f| f.extension().and_then(|s| s.to_str()) == Some("hwpx"))
+        .collect();
+    if files.is_empty() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-notes-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    let mut seen = 0usize;
+    for src in &files {
+        let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("x");
+        // ---- 백엔드를 **직접** 돌려 무엇을 말하는지 받는다
+        let raw_out = dir.join(format!("{stem}-raw.hwp"));
+        let (sp, rp) = (src.display().to_string(), raw_out.display().to_string());
+        let Ok((_, said)) = rhwp.run_with_notes(&["convert", &sp, &rp]) else { continue };
+        if said.is_empty() {
+            continue;
+        }
+        seen += said.len();
+
+        // ---- 우리 `convert` 로 같은 일을 하고 보고를 본다
+        let ours = dir.join(format!("{stem}-ours.hwp"));
+        let r = hwp_core::convert::convert(&rhwp, src, &ours, true)
+            .unwrap_or_else(|e| panic!("{} 변환: {e:#}", src.display()));
+        for s in &said {
+            assert!(
+                r.warnings.iter().any(|w| w.contains(s.trim())),
+                "{} — 백엔드가 말한 것을 보고가 빠뜨렸다\n  말한 것: {s}\n  보고: {:?}",
+                src.display(),
+                r.warnings
+            );
+        }
+    }
+    // **본 것이 있는지 확인한다.** 백엔드가 아무 말도 안 하는 코퍼스였다면
+    // 통과해도 뜻이 없다 — 그래서 이 시험은 실무 문서를 요구한다.
+    assert!(
+        seen > 0,
+        "백엔드가 손실을 말한 문서가 없다 — 이 시험이 아무것도 보지 않았다"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

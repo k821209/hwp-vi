@@ -1324,13 +1324,20 @@ fn apply_ops(
     }
 
     let report = edit::save(rhwp, target, &log)?;
-    let saved = json!({
+    let mut saved = json!({
         "path": report.path.display().to_string(),
         "backup": report.backup.as_ref().map(|b| b.display().to_string()),
         "opsApplied": report.ops_applied,
         "paragraphs": report.paragraphs,
         "cells": report.cells,
     });
+    // **백엔드가 성공하면서 말한 손실을 싣는다.** 버리면 "저장했습니다" 만
+    // 남고 무엇을 잃었는지 아무도 모른다.
+    if !report.notes.is_empty() {
+        if let Value::Object(m) = &mut saved {
+            m.insert("warnings".into(), json!(report.notes));
+        }
+    }
     Ok((applied, changed, Some(saved)))
 }
 

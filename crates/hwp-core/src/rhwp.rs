@@ -87,6 +87,27 @@ pub struct Rhwp {
     caps: Capabilities,
 }
 
+/// 백엔드가 **성공하면서** 말한 것 중 사람이 알아야 할 줄.
+///
+/// 무엇을 고르나. 백엔드는 진행 상황도 stderr 로 내므로 전부 올리면 소음이
+/// 된다. **잃었다·못 했다** 쪽만 고른다 — 그게 받는 쪽의 결정을 바꾼다.
+fn notes_from(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| {
+            !l.is_empty()
+                && (l.contains("손실")
+                    || l.contains("미지원")
+                    || l.contains("지원하지")
+                    || l.contains("경고")
+                    || l.contains("⚠")
+                    || l.to_lowercase().contains("warning"))
+        })
+        .map(|l| l.to_string())
+        .collect()
+}
+
 impl Rhwp {
     /// 바이너리를 찾고 호환성 게이트를 통과시킨다.
     pub fn discover(pin: &Pin) -> Result<Self> {
@@ -130,6 +151,33 @@ impl Rhwp {
             bail!("rhwp {} 실패 (exit {code}): {}", args.join(" "), msg.trim());
         }
         Ok(out.stdout)
+    }
+
+    /// `run` 과 같지만 **stderr 도 돌려준다.**
+    ///
+    /// `run` 은 성공했을 때 stderr 를 버린다. 그런데 백엔드는 **성공하면서
+    /// 손실을 알려 준다** — 실측:
+    ///
+    /// ```text
+    /// [hwp5] 필드(Formula) 파라미터 4개 손실 — HWP5 CTRL_DATA에 규정된 슬롯 없음
+    /// ```
+    ///
+    /// 그걸 버리면 "바꿨습니다" 만 남고 **무엇을 잃었는지는 아무도 모른다.**
+    /// 조용히 틀리는 쪽이 제일 비싸다는 이 저장소의 기준에 그대로 걸린다.
+    pub fn run_with_notes(&self, args: &[&str]) -> Result<(Vec<u8>, Vec<String>)> {
+        let out = Command::new(&self.bin)
+            .args(args)
+            .output()
+            .with_context(|| format!("rhwp 실행 실패: {}", self.bin.display()))?;
+        if !out.status.success() {
+            let code = out.status.code().unwrap_or(-1);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let msg = if stderr.trim().is_empty() { stdout } else { stderr };
+            bail!("rhwp {} 실패 (exit {code}): {}", args.join(" "), msg.trim());
+        }
+        let notes = notes_from(&String::from_utf8_lossy(&out.stderr));
+        Ok((out.stdout, notes))
     }
 
     /// `--json` 을 붙여 호출하고 역직렬화한다.
@@ -558,6 +606,21 @@ pub fn gate(pin: &Pin, caps: &Capabilities) -> Result<(), GateFailure> {
         return Err(GateFailure::CommandsWithoutJson { names: no_json });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod note_tests {
+    #[test]
+    fn 손실을_말한_줄만_고른다() {
+        let err = "진행: 구역 0 변환\n                   [hwp5] 필드(Formula) 파라미터 4개 손실 — 규정된 슬롯 없음\n                   저장 완료: out.hwp (852KB)\n                   경고: 표 폭이 용지를 넘습니다\n";
+        let got = super::notes_from(err);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got[0].contains("손실"), "{got:?}");
+        assert!(got[1].contains("경고"), "{got:?}");
+        // 진행·완료 줄은 올리지 않는다 — 전부 올리면 소음이 되고, 소음은
+        // 사람이 경고를 안 읽게 만든다
+        assert!(!got.iter().any(|g| g.contains("진행") || g.contains("저장 완료")), "{got:?}");
+    }
 }
 
 #[cfg(test)]

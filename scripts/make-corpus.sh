@@ -231,9 +231,10 @@ cat > "$DEST/MANIFEST.json" <<EOF
     "글자 꾸밈 — 기울임·색·글꼴 (진하게 한 구간만 있다)",
     "글상자",
     "실무 문서의 글머리 조합 42가지",
-    "강제 줄바꿈 (백엔드의 insert-text 가 줄바꿈을 거부해 만들 수 없다)"
+    "강제 줄바꿈 (백엔드의 insert-text 가 줄바꿈을 거부해 만들 수 없다)",
+    "누름틀·수식·하이퍼링크 필드 (그래서 변환 손실 경고가 나오지 않는다)"
   ],
-  "inactive_guards": 21,
+  "inactive_guards": 22,
   "inactive_guards_note": "실무 문서가 있어야 뜻이 있는 시험 수. 합성 코퍼스에서는 꺼지고, 꺼진 수가 이 수와 다르면 the_corpus_declares_what_it_cannot_check 가 깨진다.",
   "note": "덮지 못하는 것이 결함을 찾아 준 것들이다. 실무 문서 회귀 관문은 비공개 저장소가 들고 있다."
 }

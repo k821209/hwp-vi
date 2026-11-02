@@ -1439,6 +1439,20 @@ fn write_file(app: &mut App) -> bool {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "없음".into())
             );
+            // **백엔드가 성공하면서 말한 손실을 상태줄에 붙인다.**
+            //
+            // 버리면 "저장했습니다" 만 남는다. 실측: `.hwpx`→`.hwp` 에서 필드
+            // 파라미터가 사라지는데 백엔드는 그걸 stderr 로 말하고 우리는
+            // 버리고 있었다. 한 줄만 붙인다 — 상태줄은 한 줄이고, 전문은
+            // `hwp api` 쪽이 `warnings` 로 준다.
+            if let Some(first) = report.notes.first() {
+                let more = report.notes.len().saturating_sub(1);
+                app.message.push_str(&format!(
+                    "  ⚠ {}{}",
+                    first,
+                    if more > 0 { format!(" (그 외 {more}건)") } else { String::new() }
+                ));
+            }
         }
         Err(e) => {
             // 첫 줄만 상태줄에 — 전문은 종료 후 stderr 로도 나간다

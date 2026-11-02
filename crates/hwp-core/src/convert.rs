@@ -312,7 +312,12 @@ pub fn convert(rhwp: &Rhwp, src: &Path, dest: &Path, overwrite: bool) -> Result<
     let (s, d) = (src.display().to_string(), tmp.display().to_string());
     // 백엔드의 `--verify` 도 켠다. 믿는 근거는 아니지만, 백엔드가 자기 쪽에서
     // 이미 아는 문제를 들고 있으면 우리 대조 전에 멈춰 주는 것이 낫다.
-    rhwp.run(&[cmd, &s, &d, "--verify"])
+    // **백엔드가 성공하면서 말한 손실도 받는다.** 버리면 "바꿨습니다" 만 남고
+    // 무엇을 잃었는지 아무도 모른다. 실측: `.hwpx` → `.hwp` 에서 필드
+    // (Formula·Hyperlink) 파라미터가 사라지는데 — HWP5 에 담을 슬롯이 없다 —
+    // 우리는 그 줄을 버리고 성공만 보고하고 있었다.
+    let (_, backend_notes) = rhwp
+        .run_with_notes(&[cmd, &s, &d, "--verify"])
         .with_context(|| format!("백엔드 {cmd} 가 실패했습니다"))?;
     if !tmp.is_file() {
         bail!("백엔드가 {} 를 만들지 않았습니다", tmp.display());
@@ -346,7 +351,14 @@ pub fn convert(rhwp: &Rhwp, src: &Path, dest: &Path, overwrite: bool) -> Result<
         paragraphs: want.paras.len(),
         cells: want.cells.len(),
         images,
-        warnings: diff.soft,
+        warnings: {
+            let mut w = diff.soft;
+            // 백엔드의 말을 **앞에** 둔다 — 포맷이 담을 수 없다는 사실이
+            // 우리 비교 결과보다 먼저 알아야 할 것이다.
+            let mut all = backend_notes;
+            all.append(&mut w);
+            all
+        },
     })
 }
 
