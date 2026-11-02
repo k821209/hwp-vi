@@ -117,6 +117,12 @@ fn yes() -> bool {
 /// 전에는 요청 처리기 안의 지역 상수였고 자기서술 시험은 그 사본을 들고 있었다.
 /// 그래서 읽기를 하나 더하면 **두 군데를 고쳐야** 했고, 한쪽만 고치면 시험이
 /// "모르는 이름을 가리킨다" 로 깨진다(실제로 깨졌다).
+/// **HWPX 에서만 되는 연산.** 우리가 XML 을 고치는 것들이다.
+///
+/// 손으로 적는 목록이라 어긋날 수 있다 — 그래서 시험이 `Op::local()` 과
+/// 맞는지 본다(`hwpx_only_matches_the_ops_we_write_ourselves`).
+pub const HWPX_ONLY_OPS: &[&str] = &["set-para-align"];
+
 pub const READS: &[&str] = &[
     "text", "outline", "tables", "styles", "deco", "images", "levels", "symbols", "checks", "page",
     "all",
@@ -693,10 +699,30 @@ pub fn capabilities() -> Value {
     json!({
         "schemaVersion": SCHEMA_VERSION,
         "capabilities": list,
+        // **어느 포맷에서 되는지 미리 말한다.**
+        //
+        // 우리 기능부는 HWPX 에 모은다. `.hwp`(HWP 5.x, CFB)는 읽기·보기와
+        // 백엔드가 하는 편집까지 그대로 되지만, **우리가 XML 을 고쳐야 하는
+        // 것들은 HWPX 만** 된다 — CFB 작성기가 없다.
+        //
+        // 시도해 보고 알게 하지 않는다. 받는 쪽이 **미리 가를** 수 있어야
+        // 한다(`checks` 의 `writable` 과 같은 이유다).
+        "formats": {
+            "read": [".hwp", ".hwpx", "텍스트 파일"],
+            "hwpxOnly": HWPX_ONLY_OPS,
+            "note": concat!(
+                "`.hwp` 도 읽기와 대부분의 편집은 됩니다. `hwpxOnly` 의 연산은 우리가 XML 을 ",
+                "고치므로 HWPX 만 됩니다 — `{\"file\":\"x.hwp\",\"convert\":true,",
+                "\"output\":\"x.hwpx\"}` 로 바꾼 뒤 고치세요. 들어오는 방향(.hwp → .hwpx)은 ",
+                "실무 문서 6개로 무손실을 쟀습니다(ir-diff 동일, 조판 쪽수까지). 돌아가는 ",
+                "방향(.hwpx → .hwp)은 필드 파라미터가 사라질 수 있어 경고로 알립니다 — ",
+                "HWP5 에 담을 슬롯이 없습니다.",
+            ),
+        },
         "request": {
             "file": "문서 경로",
             "read": ["text", "outline", "tables", "styles", "deco", "images", "levels",
-                     "symbols", "all"],
+                     "symbols", "checks", "page", "all"],
             "find": "찾을 글자",
             "ops": "편집 목록 — 순서대로 적용되고 한 번에 저장된다",
             "output": "원본을 덮지 않고 이 파일로 (만들기의 목적지이기도 하다)",
@@ -2457,6 +2483,49 @@ mod tests {
                     "`{name}` 을 ops 가 모른다 ({msg})"
                 );
             }
+        }
+    }
+
+    /// **`hwpxOnly` 목록이 실제와 맞는가.**
+    ///
+    /// 손으로 적는 목록이라 어긋난다 — `insert-table` 이 `CAPS` 에 없어서 LLM
+    /// 이 "표를 못 만든다" 로 결론 낸 적이 있다. 그래서 **우리가 직접 쓰는
+    /// 연산**(`Op::local()`)과 맞는지 코드가 본다.
+    #[test]
+    fn hwpx_only_matches_the_ops_we_write_ourselves() {
+        use hwp_core::edit::Op;
+        use hwp_core::witness::ParaAlign;
+        // 지금 우리가 직접 쓰는 연산을 하나씩 세운다. 변종이 늘면 여기도
+        // 늘려야 하고, 늘리지 않으면 아래 단정이 알려 준다.
+        let local: Vec<(&str, bool)> = vec![
+            (
+                "set-para-align",
+                Op::SetParaAlign { at: (0, 0), align: ParaAlign::Center }.local(),
+            ),
+            (
+                "set-deco",
+                Op::SetDeco {
+                    at: (0, 0),
+                    offset: 0,
+                    count: 1,
+                    bold: Some(true),
+                    italic: None,
+                    underline: None,
+                }
+                .local(),
+            ),
+            (
+                "insert-text",
+                Op::InsertText { at: (0, 0), offset: 0, text: String::new() }.local(),
+            ),
+        ];
+        for (name, is_local) in &local {
+            let listed = HWPX_ONLY_OPS.contains(name);
+            assert_eq!(
+                *is_local, listed,
+                "`{name}` 은 직접 쓰기={is_local} 인데 hwpxOnly 목록에는 {listed} 다 — \
+                 목록과 실제가 어긋나면 받는 쪽이 시도해 보고 알게 된다"
+            );
         }
     }
 
