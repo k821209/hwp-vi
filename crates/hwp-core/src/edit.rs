@@ -118,6 +118,43 @@ pub enum Op {
     /// `.hwp`(CFB)는 **할 수 없다.** 우리에게 CFB 작성기가 없다 — 그쪽은
     /// `convert` 로 HWPX 로 바꾼 뒤 고치는 길이 있다.
     SetParaAlign { at: Coord, align: crate::witness::ParaAlign },
+    /// **그림을 넣는다 — 우리가 직접.** 백엔드에 해당 명령이 없다.
+    ///
+    /// 공개 이슈 #6. 백엔드의 `edit` 하위명령에 그림 넣기가 없어서, 이것을
+    /// 하려면 HWPX 의 zip 을 풀어 XML 을 직접 고치는 길밖에 없었다 — 그
+    /// 길에는 자가검증이 **아예 없다**. 네 번째였다(`set-cell` 한 줄 제한,
+    /// 칸 문단 좌표 없음, 개체 달린 단락 삭제 거부, 그리고 이것).
+    ///
+    /// 만질 곳은 네 군데다(실측 2026-11-02):
+    ///
+    /// - `BinData/<이름>` — 바이트 그대로
+    /// - `Contents/content.hpf` — `<opf:item … isEmbeded="1"/>` 등록부
+    /// - 그 단락 `hp:run` 안의 `hp:pic`
+    /// - 그 안에 **여섯 번 반복되는 크기**(`orgSz`·`curSz`·`imgRect` 점 4개·
+    ///   `imgClip`·`imgDim`·`sz`) 와 `hp:pos/@treatAsChar`
+    ///
+    /// `META-INF/manifest.xml` 은 비어 있어서 손댈 것이 없다.
+    ///
+    /// **`part` 는 부르는 쪽이 정한다**(`hwpx::next_bin_part`). 표에 `index` 를
+    /// 미리 세어 적는 것과 같은 이유다 — 늘어날 부품 이름을 저장 전에 말할 수
+    /// 있어야 자가검증이 "부품이 딱 그것만 늘었는가" 를 물을 수 있다.
+    ///
+    /// 바이트를 연산에 담고 파일 경로를 담지 않는다. 재생은 원본 위에서 다시
+    /// 일어나므로, 그 사이 파일이 바뀌면 **말한 것과 다른 그림**이 들어간다.
+    ///
+    /// `.hwp`(CFB)는 **할 수 없다** — 우리에게 CFB 작성기가 없다. `convert` 로
+    /// `.hwpx` 로 바꾼 뒤 넣는 길이 있고, 메시지가 그것을 말한다.
+    InsertImage {
+        at: Coord,
+        /// `BinData/image3.png` 꼴. 확장자가 형식을 정한다.
+        part: String,
+        bytes: Vec<u8>,
+        /// 놓을 크기 (HWPUNIT, 1pt = 100)
+        width: u32,
+        height: u32,
+        /// 글자처럼 취급 — 참이면 본문 줄에 섞인다.
+        inline: bool,
+    },
     /// `edit delete-table` — 표를 지운다. **단락은 남는다.**
     ///
     /// 사용자 보고(2026-10-29): 다른 세션이 HWPX 의 zip 을 풀어 XML 을 직접
@@ -262,7 +299,7 @@ impl Op {
             ],
             // **우리가 직접 하는 연산은 백엔드 명령이 없다.** 재생 루프가
             // `local()` 을 보고 `apply_local` 로 보낸다.
-            Op::SetParaAlign { .. } => Vec::new(),
+            Op::SetParaAlign { .. } | Op::InsertImage { .. } => Vec::new(),
             Op::SetDeco { at, offset, count, bold, italic, underline } => {
                 let mut props = serde_json::Map::new();
                 for (k, v) in [("bold", bold), ("italic", italic), ("underline", underline)] {
@@ -302,11 +339,13 @@ impl Op {
 
     /// **우리가 직접 하는 연산인가.** 백엔드 명령이 없다.
     ///
-    /// 백엔드가 못 하거나 못 믿을 자리에만 쓴다. 지금은 문단 정렬 하나다 —
-    /// `apply-para-format` 이 모르는 키를 조용히 무시하고 값을 절반만
-    /// 반영하므로(실측), 그 위에 연산을 올릴 수 없었다.
+    /// 백엔드가 **못 하거나 못 믿을** 자리에만 쓴다. 지금 둘이다:
+    ///
+    /// - 문단 정렬 — `apply-para-format` 이 모르는 키를 조용히 무시하고 아는
+    ///   키는 값을 절반만 반영한다(실측). 그 위에 연산을 올릴 수 없었다.
+    /// - 그림 넣기 — 백엔드에 **명령 자체가 없다**.
     pub fn local(&self) -> bool {
-        matches!(self, Op::SetParaAlign { .. })
+        matches!(self, Op::SetParaAlign { .. } | Op::InsertImage { .. })
     }
 
     /// 우리 손으로 고친다. HWPX 만 된다.
@@ -331,6 +370,11 @@ impl Op {
         match self {
             Op::SetParaAlign { at, align } => {
                 crate::hwpx::set_para_align(&mut pkg, at.0, at.1, align.owpml())?;
+            }
+            Op::InsertImage { at, part, bytes, width, height, inline } => {
+                crate::hwpx::insert_image(
+                    &mut pkg, at.0, at.1, part, bytes.clone(), *width, *height, *inline,
+                )?;
             }
             other => bail!("우리가 직접 할 수 있는 연산이 아닙니다: {}", other.describe()),
         }
@@ -376,6 +420,14 @@ impl Op {
                     what.join(" · ")
                 )
             }
+            Op::InsertImage { at, part, bytes, width, height, inline } => format!(
+                "구역{} 단락{} 에 그림 넣기 — {part} ({}KB, {:.1}×{:.1}pt, {})",
+                at.0, at.1,
+                (bytes.len() + 512) / 1024,
+                *width as f64 / 100.0,
+                *height as f64 / 100.0,
+                if *inline { "글자처럼" } else { "따로 놓기" }
+            ),
             Op::DeleteTable { at, table } => {
                 format!("구역{} 단락{} 의 표{table} 지우기 (단락은 빈 채로 남습니다)", at.0, at.1)
             }
@@ -544,6 +596,56 @@ pub struct Snapshot {
     /// 남는 구멍: 글자를 고치는 연산이 **다른 곳의** 꾸밈을 조용히 바꾸는
     /// 경우는 여전히 안 잡힌다. 적어 두고 다음에 본다.
     pub deco_checked: std::collections::BTreeSet<Coord>,
+    /// **그림마다의 놓인 크기 · 글자처럼취급 · 바이트 수**, 단락마다 모아서.
+    ///
+
+    /// **왜 개체 수(`drawings`)로 모자라나.** 개체 수는 "그림이 하나 생겼다"
+    /// 까지만 말한다. 우리가 `hp:pic` 을 손으로 쓰는데, 크기는 그 안에
+    /// **여섯 군데** 반복되고 글자처럼취급은 `hp:pos/@treatAsChar` 한 군데다.
+    /// 여섯 중 셋만 채워도 개체 수는 맞고 그림은 엉뚱한 크기로 놓인다 —
+    /// 그 꼴을 실측으로 봤다. 되읽어 대조할 수 있는 축을 다 든다.
+    ///
+    /// **한 단락 안의 순서는 비교하지 않는다** — 목록을 정렬해서 견준다.
+    /// 실측(2026-11-02, c00.hwpx 단락 0, 그림 2개): 우리가 넣은 것이 그 단락의
+    /// 첫 그림이 되었다(첫 `</hp:run>` 앞에 넣으므로). 하지만 문단의 첫 구간이
+    /// 이미 그림을 물고 있으면 뒤로 갈 수 있고, 그 셈을 재지 않고 적으면
+    /// 추측이 된다. 한 단락 안에서 순서만 틀리는 것은 못 잡는다 — 적어 둔다.
+    pub images: BTreeMap<Coord, Vec<ImageFact>>,
+    /// **본문 단락에 올라앉지 않은 그림들** — 표 칸·글상자 안. 코퍼스 그림
+    /// 43개 중 23개가 여기 해당하므로 빼면 절반을 안 보는 것이 된다.
+    ///
+    /// 좌표가 없으니 단락처럼 나눌 수 없다. 정렬한 목록 하나로 들고 **수와
+    /// 성질이 그대로인가**만 묻는다 — 칸 안 그림이 사라지는 것은 잡고, 칸
+    /// 사이를 옮겨 다니는 것은 못 잡는다.
+    pub images_elsewhere: Vec<ImageFact>,
+    /// **그림을 대조할 단락.** 여기 든 좌표만 비교한다 — 비어 있으면 그림은
+    /// 보지 않는다(개체 수 `drawings` 는 언제나 본다).
+    ///
+    /// 왜 전부가 아닌가. 개체를 지우는 연산은 그림을 **예측 불가**로 만든다:
+    /// `delete-control` 은 몇 번째 개체를 지웠는지만 알고 그것이 그림이었는지
+    /// 표였는지는 모른다. 그 자리에서 범위를 비운다 — `deco_checked` 와 같은
+    /// 셈이다.
+    pub images_checked: std::collections::BTreeSet<Coord>,
+    /// 단락 밖 그림(표 칸·글상자)을 대조하는가. 표를 지우면 그 칸의 그림이
+    /// 함께 사라지므로 거기서 끈다.
+    pub images_elsewhere_checked: bool,
+    /// **늘어날 컨테이너 부품.** 비어 있으면 "부품은 하나도 바뀌지 않는다".
+    ///
+    /// 저장 검증은 부품 목록이 바뀌면 멈춘다(실측: `.hwpx` 를 `.hwp` 로
+    /// 내보내면 ZIP 부품 12개가 CFB 스트림 11개로 바뀌었다). 그림을 넣는 것은
+    /// 부품을 **정말로** 하나 늘리는 일이므로, 묵인하는 대신 **어느 이름이**
+    /// 늘 것인지 미리 적고 그것만 허락한다.
+    pub added_parts: Vec<String>,
+}
+
+/// 그림 하나에서 되읽어 대조할 수 있는 것들. 픽셀은 보지 않는다 —
+/// 우리는 받은 바이트를 그대로 넣으므로 길이가 같으면 그 바이트다.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ImageFact {
+    /// 문서에 **놓인** 크기 (HWPUNIT). 픽셀 크기가 아니다.
+    pub placed: Option<(u32, u32)>,
+    pub inline: bool,
+    pub bytes: usize,
 }
 
 /// 보이는 글자마다의 꾸밈 표. 컨트롤 자리는 빠진다 — 편집 오프셋이 그 기준이다.
@@ -584,7 +686,32 @@ pub fn deco_marks(p: &crate::witness::Para) -> Vec<String> {
 
 /// 지금 문서의 비교 단위를 뜬다. 저장 경로와 `hwp api` 가 **같은 것**을 본다 —
 /// 좌표 셈을 두 군데 두면 반드시 어긋난다.
-pub fn snapshot(t: &Testimony) -> Snapshot {
+/// 그림들을 단락마다 모은다. 실패하면 **빈 표**를 돌려준다 — 그림을 못 읽는
+/// 것과 그림이 없는 것을 여기서 가르지 않는다(가르면 그림 없는 문서의 저장이
+/// 전부 막힌다). 그림을 넣는 연산은 `added_parts` 로 따로 걸린다.
+pub fn image_facts(path: &Path) -> (BTreeMap<Coord, Vec<ImageFact>>, Vec<ImageFact>) {
+    let mut on_para: BTreeMap<Coord, Vec<ImageFact>> = BTreeMap::new();
+    let mut elsewhere: Vec<ImageFact> = Vec::new();
+    let Ok(imgs) = crate::images::read(path) else { return (on_para, elsewhere) };
+    for i in imgs {
+        let fact = ImageFact {
+            placed: i.placed,
+            inline: i.inline,
+            bytes: i.bytes.len(),
+        };
+        match i.at {
+            Some(at) => on_para.entry(at).or_default().push(fact),
+            None => elsewhere.push(fact),
+        }
+    }
+    for v in on_para.values_mut() {
+        v.sort();
+    }
+    elsewhere.sort();
+    (on_para, elsewhere)
+}
+
+pub fn snapshot(t: &Testimony, path: &Path) -> Snapshot {
     let paras = t
         .body_paragraphs()
         .into_iter()
@@ -621,6 +748,7 @@ pub fn snapshot(t: &Testimony) -> Snapshot {
             (n > 0).then_some(((p.section, i), n))
         })
         .collect();
+    let (images, images_elsewhere) = image_facts(path);
     Snapshot {
         paras,
         cells,
@@ -629,6 +757,11 @@ pub fn snapshot(t: &Testimony) -> Snapshot {
         styles_checked: Default::default(),
         deco,
         deco_checked: Default::default(),
+        images,
+        images_elsewhere,
+        images_checked: Default::default(),
+        images_elsewhere_checked: false,
+        added_parts: Vec::new(),
     }
 }
 
@@ -709,7 +842,7 @@ pub fn save_as(rhwp: &Rhwp, src: &Path, dest: &Path, log: &EditLog) -> Result<Sa
         // 것도 없다. 처음에 거부했고, 파일이 안 생기는 것으로 드러났다.
         let witness = Testimony::read(&tmp)
             .with_context(|| format!("{} 를 다시 읽을 수 없습니다", tmp.display()))?;
-        let snap = snapshot(&witness);
+        let snap = snapshot(&witness, &tmp);
         SaveReport {
             path: dest.to_path_buf(),
             backup: None,
@@ -839,6 +972,7 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 cur.styles = shift(cur.styles, at.0, at.1, 1);
                 cur.paras = shift(cur.paras, at.0, at.1, 1);
                 cur.drawings = shift(cur.drawings, at.0, at.1, 1);
+                cur.images = shift(cur.images, at.0, at.1, 1);
                 cur.paras.insert(*at, String::new());
             }
             Op::InsertTextInCell { table, row, col, cell_para, offset, text } => {
@@ -879,6 +1013,37 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 next.extend(&chars[end..]);
                 *p = next;
                 *slot = paras.join("\n");
+            }
+            Op::InsertImage { at, part, bytes, width, height, inline } => {
+                if !cur.paras.contains_key(at) {
+                    bail!(
+                        "없는 단락에 그림을 넣으려 합니다: 구역{} 단락{}",
+                        at.0, at.1
+                    );
+                }
+                if *width == 0 || *height == 0 {
+                    bail!("놓을 크기가 0 입니다 — 그림이 보이지 않습니다 (HWPUNIT, 1pt = 100)");
+                }
+                if bytes.is_empty() {
+                    bail!("그림 바이트가 비었습니다");
+                }
+                let slot = cur.images.entry(*at).or_default();
+                slot.push(ImageFact {
+                    placed: Some((*width, *height)),
+                    inline: *inline,
+                    bytes: bytes.len(),
+                });
+                // 단락 안 순서는 비교하지 않으므로 정렬해 둔다 — 증인 쪽도
+                // 정렬해서 돌려준다.
+                slot.sort();
+                // `hp:pic` 은 우리 증인의 개체 목록에 있다(`OWPML_DRAWINGS`),
+                // 글자처럼취급이어도 그 단락의 개체가 하나 는다.
+                *cur.drawings.entry(*at).or_insert(0) += 1;
+                cur.added_parts.push(part.clone());
+                // **전부 대조한다.** 우리는 zip 을 통째로 다시 묶으므로 다른
+                // 그림을 함께 망칠 길이 있다 — 넣은 자리만 보면 그것을 못 본다.
+                cur.images_checked = cur.images.keys().copied().collect();
+                cur.images_elsewhere_checked = true;
             }
             Op::SetParaAlign { at, align } => {
                 if !cur.paras.contains_key(at) {
@@ -963,6 +1128,10 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                         cur.drawings.insert(*at, n - 1);
                     }
                 }
+                // **그 표의 칸에 있던 그림도 함께 사라진다.** 코퍼스 그림
+                // 43개 중 23개가 칸 안에 있으므로 흔한 일이다. 어느 그림이
+                // 그 표의 것인지 좌표로 가릴 수 없으니 단락 밖 대조를 끈다.
+                cur.images_elsewhere_checked = false;
                 cur.cells = std::mem::take(&mut cur.cells)
                     .into_iter()
                     .filter(|((tb, _, _), _)| tb != table)
@@ -1003,11 +1172,17 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 } else {
                     cur.drawings.insert(*at, *kept);
                 }
+                // **무엇을 지웠는지 모른다.** `ctrl` 은 몇 번째 개체인지만
+                // 말하고 그것이 그림이었는지 표였는지는 말하지 않는다. 그림
+                // 대조를 그대로 두면 "지워졌는데 있어야 한다" 로 저장이 막힌다.
+                cur.images_checked.clear();
+                cur.images_elsewhere_checked = false;
             }
             Op::InsertTable { at, rows, cols, index } => {
                 // 표와 함께 **단락 하나**가 들어간다
                 cur.paras = shift(cur.paras, at.0, at.1, 1);
                 cur.drawings = shift(cur.drawings, at.0, at.1, 1);
+                cur.images = shift(cur.images, at.0, at.1, 1);
                 cur.paras.insert(*at, String::new());
                 // 그 단락이 표를 든다
                 cur.drawings.insert(*at, 1);
@@ -1057,6 +1232,8 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 cur.paras = shift(cur.paras, at.0, at.1, -1);
                 cur.drawings.remove(at);
                 cur.drawings = shift(cur.drawings, at.0, at.1, -1);
+                cur.images.remove(at);
+                cur.images = shift(cur.images, at.0, at.1, -1);
             }
         }
     }
@@ -1152,9 +1329,25 @@ fn diff_report(
     let mut lines = Vec::new();
 
     if parts_before != parts_after {
-        let added: Vec<_> = parts_after.iter().filter(|p| !parts_before.contains(p)).collect();
+        // **늘어난다고 미리 말한 부품만 허락한다.** 그림을 넣는 것은 부품을
+        // 정말로 하나 늘리는 일이므로, 바뀜 자체를 묵인하는 대신 어느 이름이
+        // 늘 것인지를 연산이 적고(`added_parts`) 그것만 뺀다.
+        let added: Vec<_> = parts_after
+            .iter()
+            .filter(|p| !parts_before.contains(p) && !want.added_parts.contains(p))
+            .collect();
         let removed: Vec<_> = parts_before.iter().filter(|p| !parts_after.contains(p)).collect();
-        lines.push(format!("컨테이너 부품이 바뀌었습니다 — 추가 {added:?} / 제거 {removed:?}"));
+        if !added.is_empty() || !removed.is_empty() {
+            lines.push(format!(
+                "컨테이너 부품이 바뀌었습니다 — 추가 {added:?} / 제거 {removed:?}"
+            ));
+        }
+    }
+    // 말했는데 안 생긴 부품. 그림 바이트가 빠진 문서는 한글에서 빈 틀로 열린다.
+    for want_part in &want.added_parts {
+        if !parts_after.contains(want_part) {
+            lines.push(format!("넣겠다고 한 부품이 없습니다: {want_part}"));
+        }
     }
     if want.paras.len() != got.paras.len() {
         lines.push(format!(
@@ -1186,6 +1379,49 @@ fn diff_report(
             ));
             break;
         }
+    }
+
+    // **그림이 그 자리에 그 크기로 놓였는가.**
+    //
+    // 개체 수(`drawings`)만 보면 "그림이 하나 생겼다" 까지다. 우리는 `hp:pic`
+    // 을 손으로 쓰고 크기는 그 안에 **여섯 번** 반복되므로, 셋만 채워도 개체
+    // 수는 맞고 그림은 엉뚱한 크기로 놓인다. 되읽어 그 셋을 다 본다.
+    for at in &want.images_checked {
+        let empty: Vec<ImageFact> = Vec::new();
+        let w = want.images.get(at).unwrap_or(&empty);
+        let g = got.images.get(at).unwrap_or(&empty);
+        if w == g {
+            continue;
+        }
+        if w.len() != g.len() {
+            lines.push(format!(
+                "구역{} 단락{} 의 그림 수가 다릅니다 — 기대 {} / 실제 {}",
+                at.0, at.1, w.len(), g.len()
+            ));
+        } else if let Some((a, b)) = w.iter().zip(g).find(|(a, b)| a != b) {
+            let say = |f: &ImageFact| {
+                let (x, y) = f.placed.unwrap_or((0, 0));
+                format!(
+                    "{:.1}×{:.1}pt · {} · {}B",
+                    x as f64 / 100.0,
+                    y as f64 / 100.0,
+                    if f.inline { "글자처럼" } else { "따로" },
+                    f.bytes
+                )
+            };
+            lines.push(format!(
+                "구역{} 단락{} 의 그림이 다릅니다 — 기대 {} / 실제 {}",
+                at.0, at.1, say(a), say(b)
+            ));
+        }
+        break;
+    }
+    if want.images_elsewhere_checked && want.images_elsewhere != got.images_elsewhere {
+        lines.push(format!(
+            "표 칸·글상자 안의 그림이 바뀌었습니다 — 기대 {}개 / 실제 {}개",
+            want.images_elsewhere.len(),
+            got.images_elsewhere.len()
+        ));
     }
 
     // **우리가 바꾸겠다고 말한 꾸밈은 들어갔는가.**
@@ -1285,7 +1521,7 @@ pub fn save(rhwp: &Rhwp, path: &Path, log: &EditLog) -> Result<SaveReport> {
     }
 
     let before = Testimony::read(path)?;
-    let want = expected(&snapshot(&before), log.ops())?;
+    let want = expected(&snapshot(&before, path), log.ops())?;
 
     let workdir = tempdir_for(path)?;
     let result = replay(rhwp, path, log.ops(), &workdir);
@@ -1299,7 +1535,7 @@ pub fn save(rhwp: &Rhwp, path: &Path, log: &EditLog) -> Result<SaveReport> {
 
     // 독립 증인으로 읽는다 — 여기가 검증의 본체다.
     let after = Testimony::read(&staged)?;
-    let got = snapshot(&after);
+    let got = snapshot(&after, &staged);
 
     if let Some(report) = diff_report(&want, &got, &before.parts, &after.parts) {
         let _ = std::fs::remove_dir_all(&workdir);
@@ -1398,6 +1634,11 @@ mod tests {
             styles_checked: Default::default(),
             deco: Default::default(),
             deco_checked: Default::default(),
+            images: Default::default(),
+            images_elsewhere: Default::default(),
+            images_checked: Default::default(),
+            images_elsewhere_checked: false,
+            added_parts: Default::default(),
         }
     }
 

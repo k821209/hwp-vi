@@ -121,7 +121,7 @@ fn yes() -> bool {
 ///
 /// 손으로 적는 목록이라 어긋날 수 있다 — 그래서 시험이 `Op::local()` 과
 /// 맞는지 본다(`hwpx_only_matches_the_ops_we_write_ourselves`).
-pub const HWPX_ONLY_OPS: &[&str] = &["set-para-align"];
+pub const HWPX_ONLY_OPS: &[&str] = &["set-para-align", "insert-image"];
 
 pub const READS: &[&str] = &[
     "text", "outline", "tables", "styles", "deco", "images", "levels", "symbols", "checks", "page",
@@ -253,6 +253,32 @@ pub enum OpSpec {
     /// 조용히 무시하고 값을 절반만 반영한다 — 실측) 우리가 XML 을 고치는데,
     /// `.hwp`(CFB)는 작성기가 없다. `convert` 로 바꾼 뒤 고치면 된다.
     SetParaAlign { section: u32, para: u32, align: String },
+    /// **그림을 넣는다** — 그 단락의 첫 구간 안에 놓는다.
+    ///
+    /// 사용자 보고(hwp-vi#6). 백엔드의 `edit` 에 그림 넣기가 **없어서**, 이것을
+    /// 하려면 HWPX 의 zip 을 풀어 XML 을 직접 고치는 길밖에 없었다 — 그 길에는
+    /// 자가검증이 아예 없다. 그래서 우리가 쓴다.
+    ///
+    /// **크기는 mm 로 받고, 한쪽만 줘도 된다.** 비율은 그림 파일의 사실이므로
+    /// 나머지 한 변을 거기서 끌어 온다 — 양쪽을 다 받으라고 하면 **찌그러진
+    /// 그림**이 가장 흔한 실수가 된다. 일부러 찌그러뜨리려면 둘을 다 주면 된다.
+    ///
+    /// **HWPX 만 된다.** `.hwp`(CFB)는 작성기가 없다 — `hwp convert` 로 바꾼 뒤
+    /// 넣으면 되고, 거기서 다시 `.hwp` 로 돌려도 그림은 남는다(실측: 변환 뒤
+    /// `BIN0001.png` 로 같은 크기·같은 성질로 읽혔다).
+    InsertImage {
+        section: u32,
+        para: u32,
+        /// 넣을 그림 파일 (png·jpg·bmp·gif·tif)
+        path: String,
+        #[serde(rename = "widthMm", alias = "width_mm")]
+        width_mm: Option<f64>,
+        #[serde(rename = "heightMm", alias = "height_mm")]
+        height_mm: Option<f64>,
+        /// 글자처럼 취급할지. 기본 **참** — 따로 놓는 그림은 글자와 겹쳐도
+        /// 아무 말이 없으므로, 묻지 않았으면 안전한 쪽으로 둔다.
+        inline: Option<bool>,
+    },
     /// 글머리 단계를 올리거나 내린다 (`Tab` / `Shift-Tab`)
     Relevel { section: u32, para: u32, delta: isize },
     /// **빈 표를 만든다** — 그 자리에 단락 하나가 함께 들어간다.
@@ -418,6 +444,13 @@ pub const CAPS: &[Cap] = &[
         what: "문단 정렬을 바꾼다 (justify|left|right|center|distribute|division) — \
                **HWPX 만**. 좌표는 `styles` 가 준다",
         machine: Machine::Op("set-para-align"),
+        ex: &[],
+    },
+    Cap {
+        id: "insert-image",
+        what: "그림을 단락에 넣는다 — 크기는 mm, 한쪽만 주면 나머지는 그림 \
+               비율에서 온다. **HWPX 만**",
+        machine: Machine::Op("insert-image"),
         ex: &[],
     },
     Cap {
@@ -1275,7 +1308,7 @@ fn apply_ops(
         Vec::new()
     };
     let witness = Testimony::read(target)?;
-    let before = edit::snapshot(&witness);
+    let before = edit::snapshot(&witness, target);
     let mut cur = before.clone();
     let mut log = EditLog::new();
     let mut applied = Vec::new();
@@ -1283,7 +1316,7 @@ fn apply_ops(
     let mut table_shifts: Vec<TableShift> = Vec::new();
 
     for spec in specs {
-        let (ops, said) = lower(spec, &cur, &anchors)?;
+        let (ops, said) = lower(spec, &cur, &anchors, target)?;
         // 단락을 넣고 빼면 **뒤쪽 좌표가 전부 밀린다.** 밀린 자리를 그대로
         // 비교하면 한 줄 넣은 것이 "그 뒤 단락 전부가 바뀌었다" 로 보고된다 —
         // 실제로 그렇게 나왔고, 읽을 수 없는 보고였다. 그래서 구조 변경을
@@ -1381,6 +1414,7 @@ fn op_name(spec: &OpSpec) -> &'static str {
         OpSpec::CheckInCell { .. } => "check-in-cell",
         OpSpec::SetDeco { .. } => "set-deco",
         OpSpec::SetParaAlign { .. } => "set-para-align",
+        OpSpec::InsertImage { .. } => "insert-image",
         OpSpec::Relevel { .. } => "relevel",
         OpSpec::InsertTable { .. } => "insert-table",
         OpSpec::DeleteTable { .. } => "delete-table",
@@ -1459,6 +1493,9 @@ fn lower(
     spec: &OpSpec,
     cur: &Snapshot,
     anchors: &[(u32, u32, u32)],
+    // 고치는 파일. `insert-image` 가 **늘어날 부품 이름을 미리 세려면**
+    // 컨테이너를 열어 봐야 한다.
+    target: &std::path::Path,
 ) -> Result<(Vec<Op>, Option<String>)> {
     // **백엔드가 편집으로 받는 표인가.** 앵커는 백엔드의 표 목록이다.
     //
@@ -1769,6 +1806,81 @@ fn lower(
                 ),
             };
             (vec![Op::SetParaAlign { at: (*section, *para), align: a }], None)
+        }
+        OpSpec::InsertImage { section, para, path, width_mm, height_mm, inline } => {
+            text_at(*section, *para)?;
+            let src = std::path::Path::new(path);
+            let bytes = std::fs::read(src)
+                .map_err(|e| anyhow::anyhow!("그림 파일을 읽을 수 없다: {path} ({e})"))?;
+            if bytes.is_empty() {
+                anyhow::bail!("{path} 가 0바이트다");
+            }
+            let ext = src
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "gif" | "tif" | "tiff") {
+                anyhow::bail!(
+                    "그림 형식을 모른다: {:?} (받는 것: png·jpg·bmp·gif·tif)",
+                    if ext.is_empty() { "확장자 없음".to_string() } else { ext }
+                );
+            }
+            // **비율은 그림 파일의 사실이다.** 한쪽만 받고 나머지를 여기서
+            // 끌어 오면 찌그러진 그림이 나올 길이 줄어든다.
+            let px = hwp_core::images::pixel_size(&bytes);
+            // 1 mm = 7200/25.4 HWPUNIT... 가 아니다. 그림 크기는 **1/100 pt**
+            // 단위다(증인이 `placed` 를 그렇게 읽는다). 1 pt = 25.4/72 mm.
+            let mm_to_100pt = |mm: f64| (mm * 72.0 / 25.4 * 100.0).round() as u32;
+            let (w, h) = match (width_mm, height_mm) {
+                (Some(a), Some(b)) => (mm_to_100pt(*a), mm_to_100pt(*b)),
+                (Some(a), None) => {
+                    let (pw, ph) = px.ok_or_else(|| anyhow::anyhow!(
+                        "{path} 의 픽셀 크기를 읽을 수 없어서 `heightMm` 를 비율로 채울 수 없다 — 두 변을 다 주라"
+                    ))?;
+                    let w = mm_to_100pt(*a);
+                    (w, ((w as f64) * ph as f64 / pw as f64).round() as u32)
+                }
+                (None, Some(b)) => {
+                    let (pw, ph) = px.ok_or_else(|| anyhow::anyhow!(
+                        "{path} 의 픽셀 크기를 읽을 수 없어서 `widthMm` 를 비율로 채울 수 없다 — 두 변을 다 주라"
+                    ))?;
+                    let h = mm_to_100pt(*b);
+                    (((h as f64) * pw as f64 / ph as f64).round() as u32, h)
+                }
+                (None, None) => anyhow::bail!(
+                    "크기를 주라 — `widthMm` 이나 `heightMm` 중 하나만 주면 나머지는 그림 비율에서 온다. 둘을 다 주면 그 크기로 늘린다."
+                ),
+            };
+            if w == 0 || h == 0 {
+                anyhow::bail!("크기가 0 으로 계산됐다 ({w}×{h}) — mm 값을 보라");
+            }
+            // **부품 이름을 여기서 세어 연산에 적는다.** 표에 `index` 를 미리
+            // 세어 적는 것과 같은 이유다 — 늘어날 부품 이름을 저장 전에 말할
+            // 수 있어야 자가검증이 "부품이 딱 그것만 늘었는가" 를 묻는다.
+            let pkg = hwp_core::hwpx::Package::open(target).map_err(|e| {
+                anyhow::anyhow!(
+                    "{} 를 HWPX 로 열 수 없다 ({e}) — 그림 넣기는 HWPX 만 된다. `.hwp` 는 `hwp convert <파일> <출력>.hwpx` 로 바꾼 뒤 넣으라 (변환은 무손실로 실측됐다).",
+                    target.display()
+                )
+            })?;
+            let part = hwp_core::hwpx::next_bin_part(&pkg, &ext)?;
+            let inline = inline.unwrap_or(true);
+            (
+                vec![Op::InsertImage {
+                    at: (*section, *para),
+                    part: part.clone(),
+                    bytes,
+                    width: w,
+                    height: h,
+                    inline,
+                }],
+                Some(format!(
+                    "{part} 로 들어간다 ({:.1}×{:.1}mm, {})",
+                    w as f64 / 100.0 * 25.4 / 72.0,
+                    h as f64 / 100.0 * 25.4 / 72.0,
+                    if inline { "글자처럼" } else { "따로 놓기" }
+                )),
+            )
         }
         OpSpec::SetDeco { section, para, offset, count, bold, italic, underline, strike } => {
             if strike.is_some() {
@@ -2588,6 +2700,7 @@ mod tests {
             styles_checked: Default::default(),
             deco: Default::default(),
             deco_checked: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -2606,7 +2719,7 @@ mod tests {
         let mut cur = before.clone();
         let mut all = Vec::new();
         for s in &specs {
-            let (ops, _) = lower(s, &cur, &[]).unwrap();
+            let (ops, _) = lower(s, &cur, &[], std::path::Path::new("/dev/null")).unwrap();
             cur = edit::expected(&cur, &ops).unwrap();
             all.extend(ops);
         }
@@ -2624,7 +2737,7 @@ mod tests {
     fn 단락을_넣어도_밀린_것은_바뀐_것으로_세지_않는다() {
         let before = snap(&[(0, 0, "가"), (0, 1, "나"), (0, 2, "다")], &[]);
         let spec = OpSpec::InsertPara { section: 0, para: 1, text: Some("새".into()) };
-        let (ops, _) = lower(&spec, &before, &[]).unwrap();
+        let (ops, _) = lower(&spec, &before, &[], std::path::Path::new("/dev/null")).unwrap();
         let after = edit::expected(&before, &ops).unwrap();
         let shifts = vec![Shift { section: 0, para: 1, insert: true }];
         let d = diff_json(&before, &after, &shifts, &[]);
@@ -2637,7 +2750,7 @@ mod tests {
     fn 단락을_지우면_지워진_것으로_보고한다() {
         let before = snap(&[(0, 0, "가"), (0, 1, "나"), (0, 2, "다")], &[]);
         let spec = OpSpec::DeletePara { section: 0, para: 1 };
-        let (ops, _) = lower(&spec, &before, &[]).unwrap();
+        let (ops, _) = lower(&spec, &before, &[], std::path::Path::new("/dev/null")).unwrap();
         let after = edit::expected(&before, &ops).unwrap();
         let shifts = vec![Shift { section: 0, para: 1, insert: false }];
         let d = diff_json(&before, &after, &shifts, &[]);
@@ -2661,7 +2774,7 @@ mod tests {
             &[],
         );
         let (ops, said) =
-            lower(&OpSpec::Relevel { section: 0, para: 3, delta: 1 }, &before, &[]).unwrap();
+            lower(&OpSpec::Relevel { section: 0, para: 3, delta: 1 }, &before, &[], std::path::Path::new("/dev/null")).unwrap();
         assert!(!ops.is_empty());
         assert!(said.is_some(), "글머리를 옮기고 아무 말도 하지 않았다");
     }
@@ -2671,7 +2784,7 @@ mod tests {
     #[test]
     fn 사다리가_없으면_글머리를_옮기지_않는다() {
         let before = snap(&[(0, 0, "그냥 글"), (0, 1, "또 글")], &[]);
-        let e = lower(&OpSpec::Relevel { section: 0, para: 0, delta: 1 }, &before, &[]).unwrap_err();
+        let e = lower(&OpSpec::Relevel { section: 0, para: 0, delta: 1 }, &before, &[], std::path::Path::new("/dev/null")).unwrap_err();
         assert!(e.to_string().contains("글머리 단계"), "{e}");
     }
 
@@ -2680,17 +2793,13 @@ mod tests {
     #[test]
     fn 없는_좌표는_그_좌표를_말하며_거부한다() {
         let before = snap(&[(0, 0, "가")], &[(0, 0, 0, "칸")]);
-        let e = lower(&OpSpec::SetPara { section: 0, para: 9, text: "x".into() }, &before, &[])
+        let e = lower(&OpSpec::SetPara { section: 0, para: 9, text: "x".into() }, &before, &[], std::path::Path::new("/dev/null"))
             .unwrap_err();
         assert!(e.to_string().contains("단락9"), "{e}");
-        let e = lower(&OpSpec::SetCell { table: 0, row: 5, col: 5, text: Some("x".into()), lines: None }, &before, &[])
+        let e = lower(&OpSpec::SetCell { table: 0, row: 5, col: 5, text: Some("x".into()), lines: None }, &before, &[], std::path::Path::new("/dev/null"))
             .unwrap_err();
         assert!(e.to_string().contains("(5,5)"), "{e}");
-        let e = lower(
-            &OpSpec::DeleteText { section: 0, para: 0, offset: 0, count: 99 },
-            &before,
-            &[],
-        )
+        let e = lower(&OpSpec::DeleteText { section: 0, para: 0, offset: 0, count: 99 }, &before, &[], std::path::Path::new("/dev/null"))
         .unwrap_err();
         assert!(e.to_string().contains("1자"), "{e}");
     }

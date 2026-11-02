@@ -733,6 +733,7 @@ fn self_verifying_save_refuses_when_the_result_would_differ() {
             styles_checked: Default::default(),
             deco: Default::default(),
             deco_checked: Default::default(),
+            ..Default::default()
         },
         &[Op::DeleteText { at: (sec, para), offset: 0, count: 500 }],
     )
@@ -3925,7 +3926,7 @@ fn a_paragraph_that_holds_a_drawing_still_refuses_but_names_the_way_out() {
     let Some(((rhwp, _), files)) = backend().zip(Some(samples())) else { return };
     let Some((src, at)) = files.iter().find_map(|f| {
         let t = Testimony::read(f).ok()?;
-        let snap = hwp_core::edit::snapshot(&t);
+        let snap = hwp_core::edit::snapshot(&t, f);
         snap.drawings
             .iter()
             .find(|&(_, &n)| n > 0)
@@ -4786,4 +4787,159 @@ fn the_corpus_declares_what_it_cannot_check() {
         REAL_CORPUS_ONLY.len(),
         REAL_CORPUS_ONLY.join("\n    ")
     );
+}
+
+/// **그림을 넣고 되읽어 확인한다** — 공개 이슈 #6.
+///
+/// 백엔드에 그림 넣기 명령이 **없어서**, 이 일을 하려면 HWPX 의 zip 을 풀어
+/// XML 을 직접 고치는 길밖에 없었다 — 자가검증이 아예 없는 길이다. 그래서
+/// 우리가 쓰고, 쓴 것을 증인이 되읽는다.
+///
+/// 네 축을 본다: **어느 단락**에 · **어떤 크기**로 · **글자처럼인가** ·
+/// **바이트가 그대로인가**. 개체 수만 보면 "그림이 하나 생겼다" 까지이고,
+/// 크기가 엉뚱해도 통과한다.
+///
+/// 보증 범위를 적어 둔다: 증인은 `placed` 를 `hp:orgSz × hc:scaMatrix` 로
+/// 구하므로, 이 시험이 보는 것은 **그 한 자리**다. `hp:pic` 안 일곱 자리가
+/// 서로 어긋나는 것은 문서의 사고가 아니라 코드 결함이고, 그쪽은
+/// `hwpx::pic_tests::그림_크기는_일곱_자리에_같은_수로_적힌다` 가 본다.
+#[test]
+fn an_image_we_insert_is_read_back_at_the_size_and_flow_we_asked_for() {
+    let Some((rhwp, _)) = backend() else { return };
+    // HWPX 만 된다 — `.hwp`(CFB)는 작성기가 없다
+    let Some(src) = samples()
+        .into_iter()
+        .find(|f| f.extension().and_then(|s| s.to_str()) == Some("hwpx"))
+    else {
+        return;
+    };
+
+    // 넣을 그림을 여기서 만든다 — 코퍼스 파일에 의존하지 않는다
+    let png = {
+        let img = image::RgbImage::from_fn(6, 3, |x, _| {
+            image::Rgb([(x * 40) as u8, 90, 200])
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("PNG 로");
+        buf.into_inner()
+    };
+    assert!(!png.is_empty());
+
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-img-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let doc = dir.join(src.file_name().expect("이름"));
+    std::fs::copy(&src, &doc).expect("문서");
+
+    // 글자가 있는 본문 단락 하나를 고른다
+    let t = Testimony::read(&doc).expect("증인");
+    let Some(at) = t.body_paragraphs().into_iter().find_map(|p| {
+        let i = p.index?;
+        (!hwp_core::offset::visible(&p.text).trim().is_empty()).then_some((p.section, i))
+    }) else {
+        panic!("글자 있는 본문 단락이 없다");
+    };
+    let before = hwp_core::images::read(&doc).expect("그림 읽기").len();
+
+    // 부품 이름은 **부르는 쪽이 센다** — `expected` 가 그 이름을 미리 알아야
+    // "부품이 딱 그것만 늘었는가" 를 물을 수 있다
+    let part = {
+        let pkg = hwp_core::hwpx::Package::open(&doc).expect("풀기");
+        hwp_core::hwpx::next_bin_part(&pkg, "png").expect("빈 이름")
+    };
+
+    const W: u32 = 9_000; // 90.0pt
+    const H: u32 = 4_500; // 45.0pt
+    let mut log = hwp_core::edit::EditLog::new();
+    log.push(hwp_core::edit::Op::InsertImage {
+        at,
+        part: part.clone(),
+        bytes: png.clone(),
+        width: W,
+        height: H,
+        inline: true,
+    });
+    hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("그림 넣기: {e:#}"));
+
+    // ---- 되읽는다
+    let imgs = hwp_core::images::read(&doc).expect("그림 읽기");
+    assert_eq!(imgs.len(), before + 1, "그림이 하나 늘어야 한다");
+    let Some(got) = imgs.iter().find(|i| i.name == part) else {
+        panic!("{part} 를 넣었는데 그 이름의 그림이 없다 — 읽힌 것: {:?}",
+               imgs.iter().map(|i| &i.name).collect::<Vec<_>>());
+    };
+    assert_eq!(got.at, Some(at), "넣으라고 한 단락이 아니다");
+    assert_eq!(got.placed, Some((W, H)), "놓인 크기가 다르다");
+    assert!(got.inline, "글자처럼 취급해 달라고 했다");
+    assert_eq!(got.bytes, png, "넣은 바이트가 그대로여야 한다");
+    assert!(got.cell.is_none(), "표 칸 안으로 들어갔다 — 단락 자기 수준에 놓아야 한다");
+
+    // ---- 백엔드가 받는가. 우리가 손으로 쓴 `hp:pic` 이므로 이것이 본 시험이다.
+    let out = dir.join("back.hwp");
+    let _ = std::fs::remove_file(&out);
+    rhwp.run(&[
+        "convert",
+        &doc.to_string_lossy(),
+        &out.to_string_lossy(),
+        "--verify",
+    ])
+    .unwrap_or_else(|e| panic!("백엔드가 우리가 넣은 그림을 거부했다: {e:#}"));
+    let back = hwp_core::images::read(&out).expect("변환본의 그림");
+    assert_eq!(back.len(), imgs.len(), "변환하며 그림이 사라졌다");
+    assert!(
+        back.iter().any(|i| i.placed == Some((W, H)) && i.inline && i.bytes == png),
+        "변환본에 같은 크기·같은 성질의 그림이 없다"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **`.hwp` 에는 넣지 못하고, 어디로 가야 하는지 말한다.**
+///
+/// CFB 작성기가 없다는 것은 우리 쪽 한계다. 조용히 실패하거나 "안 된다" 로
+/// 끝나면 사용자는 다시 XML 을 직접 고치는 길로 간다 — 그 길에는 자가검증이
+/// 없다. 그래서 메시지가 `convert` 를 가리켜야 한다.
+#[test]
+fn inserting_an_image_into_a_hwp5_file_names_the_conversion_path() {
+    let Some((rhwp, _)) = backend() else { return };
+    let Some(src) = samples()
+        .into_iter()
+        .find(|f| f.extension().and_then(|s| s.to_str()) == Some("hwp"))
+    else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-img5-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let doc = dir.join(src.file_name().expect("이름"));
+    std::fs::copy(&src, &doc).expect("문서");
+    let keep = std::fs::read(&doc).expect("원본 바이트");
+
+    let t = Testimony::read(&doc).expect("증인");
+    let at = t
+        .body_paragraphs()
+        .into_iter()
+        .find_map(|p| p.index.map(|i| (p.section, i)))
+        .expect("본문 단락");
+
+    let mut log = hwp_core::edit::EditLog::new();
+    log.push(hwp_core::edit::Op::InsertImage {
+        at,
+        part: "BinData/image9.png".into(),
+        bytes: vec![0x89, b'P', b'N', b'G'],
+        width: 1000,
+        height: 1000,
+        inline: true,
+    });
+    let e = hwp_core::edit::save(&rhwp, &doc, &log)
+        .expect_err(".hwp 에는 그림을 넣을 수 없어야 한다");
+    let msg = format!("{e:#}");
+    assert!(msg.contains("convert"), "길을 말하지 않는다: {msg}");
+    assert!(msg.contains("HWPX"), "왜 안 되는지 말하지 않는다: {msg}");
+    assert_eq!(
+        std::fs::read(&doc).expect("다시 읽기"),
+        keep,
+        "거부했는데 원본이 바뀌었다"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

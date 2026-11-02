@@ -195,6 +195,17 @@ fn human_bytes(n: usize) -> String {
     }
 }
 
+/// **아직 문서에 들어가지 않은 그림의 픽셀 크기.** 넣을 때 비율을 지키는 데
+/// 쓴다 — 한 변만 받고 나머지를 여기서 끌어 오면 찌그러진 그림이 줄어든다.
+///
+/// `DocImage::dimensions` 과 같은 일을 바이트에만 대고 한다. `image` 크레이트가
+/// 이 크레이트에만 있으므로 쓰는 쪽(`hwp api`)이 여기로 물어본다.
+pub fn pixel_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::load_from_memory(bytes)
+        .ok()
+        .map(|i| (i.width(), i.height()))
+}
+
 /// 문서의 그림을 전부 읽는다.
 pub fn read(path: &Path) -> Result<Vec<DocImage>> {
     match crate::witness::sniff_container(path)? {
@@ -678,6 +689,13 @@ fn picture_refs(xml: &str, section: u32, next_table: &mut u32) -> Result<Vec<Pic
         if let Event::Start(e) | Event::Empty(e) = &ev {
             match name.as_str() {
                 "hp:tbl" => {
+                    // **표도 `hp:pos` 를 가진 개체다.** `obj_start` 를 같이
+                    // 옮기지 않으면 표의 위치가 **앞서 읽은 그림의 `inline`·
+                    // 정렬을 덮는다** — 실측으로 확인했다(그림 뒤에 표가 오면
+                    // `inline` 이 거짓으로 뒤집힌다).
+                    if draw_depth == 0 {
+                        obj_start = out.len();
+                    }
                     if !is_empty {
                         open.push(TableCtx { table: *next_table, cell_start: out.len() });
                     }
@@ -701,7 +719,22 @@ fn picture_refs(xml: &str, section: u32, next_table: &mut u32) -> Result<Vec<Pic
                         }
                     }
                 }
-                "hp:container" | "hp:pic" => {
+                // **`hp:pos` 는 "가장 최근에 열린 개체" 의 것이다.**
+                //
+                // 전에는 `hp:container`·`hp:pic` 에서만 `obj_start` 를 옮겼다.
+                // 그래서 **그림 뒤에 표가 오면** 그 표의 `hp:pos` 가
+                // `out[obj_start..]` 에 적용되어 **앞서 읽은 그림의 `inline`·
+                // 정렬을 덮었다.** 실측(문서 순서):
+                //
+                //     hp:tbl / hp:pos treatAsChar=0   ← 표
+                //     hp:pic / hp:pos treatAsChar=1   ← 그림 (여기서 inline=참)
+                //     hp:tbl / hp:pos treatAsChar=0   ← 표 → 그림을 덮는다
+                //
+                // 표도 위치를 가진 개체이므로 `obj_start` 를 같이 옮긴다.
+                // 그러면 표의 `hp:pos` 는 빈 구간에 적용되어 아무것도 안 덮는다.
+                "hp:container" | "hp:pic" | "hp:rect" | "hp:ellipse"
+                | "hp:line" | "hp:polygon" | "hp:curve" | "hp:connectLine" | "hp:ole"
+                | "hp:equation" | "hp:textart" => {
                     if draw_depth == 0 {
                         obj_start = out.len();
                     }
