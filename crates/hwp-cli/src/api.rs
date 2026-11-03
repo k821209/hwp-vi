@@ -995,6 +995,31 @@ pub fn run(req: Request) -> Result<Value> {
                 "tables": report.tables,
                 "cells": report.cells,
                 "verifiedBy": "witness",
+                // **블록이 각각 어디로 갔는가.** 이게 없으면 부르는 쪽이
+                // 문서를 되읽어 **글자로 짝을 맞춰야** 한다 — 실제로 교재
+                // 원고를 만드시던 분이 그 코드를 직접 쓰셨고, 같은 글자가
+                // 두 번 나오면 깨지는 방식이었다.
+                //
+                // 좌표는 **그 종류가 쓰는 것**으로 준다: 문단은 `at`(그대로
+                // `set-char`·`set-para-style` 에 넣는다), 표는 `table`
+                // 번호(`set-cell` 이 받는 것), 그림은 `at` + 부품 이름.
+                "blocksAt": report.blocks_at.iter().map(|b| {
+                    let mut o = Map::new();
+                    o.insert("index".into(), json!(b.index));
+                    o.insert("kind".into(), json!(b.kind));
+                    if let Some((s, p)) = b.at {
+                        o.insert("at".into(), json!(format!("{s}:{p}")));
+                        o.insert("section".into(), json!(s));
+                        o.insert("para".into(), json!(p));
+                    }
+                    if let Some(t) = b.table {
+                        o.insert("table".into(), json!(t));
+                    }
+                    if let Some(n) = &b.name {
+                        o.insert("name".into(), json!(n));
+                    }
+                    Value::Object(o)
+                }).collect::<Vec<_>>(),
             }),
         );
         // **만들어졌지만 적용되지 않은 것은 말한다.** 비어 있으면 칸을 내지

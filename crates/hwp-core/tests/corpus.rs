@@ -6060,3 +6060,104 @@ fn an_inserted_image_does_not_cover_what_follows_it() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **만든 뒤 "그 블록이 어디로 갔나" 를 말한다.**
+///
+/// 사용자 보고(2026-11-03): `create` 가 그걸 말하지 않아서, 교재 원고를
+/// 만드시던 분이 **문서를 되읽어 글자로 짝을 맞추는** 코드를 직접 쓰셨다.
+/// 그 스크립트의 주석이 그대로 증언한다 — "create 가 넘긴 블록 순서와 문서
+/// 문단 번호는 다르다(제목 문단, 표가 끼어든다). 그래서 글자로 찾아 맞춘다."
+///
+/// 읽기 좌표와 쓰기 좌표가 맞아야 한다는 것은 이 저장소의 **1번 이슈**였다
+/// (`checks` 가 `tables` 에 없는 표를 가리켰다). 만들기 쪽에 같은 구멍이
+/// 남아 있었다.
+///
+/// **같은 글자가 두 번 나와도 갈려야 한다.** 집합으로 맞추면 거기서 깨진다 —
+/// 사용자의 우회가 정확히 그 방식이었다. 앞에서부터 훑으면 순서대로 갈린다.
+///
+/// 좌표는 **그 종류가 쓰는 것**으로 준다: 문단은 `(구역, 단락)`(그대로
+/// `set-char`·`set-para-style` 에 넣는다), 표는 표 번호(`set-cell` 이 받는 것).
+#[test]
+fn create_reports_where_each_block_landed() {
+    let Some((rhwp, _)) = backend() else { return };
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-map-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+    let png = dir.join("f.png");
+    image::RgbImage::from_fn(10, 6, |x, _| image::Rgb([(x * 20) as u8, 80, 150]))
+        .save(&png)
+        .expect("PNG");
+    let out = dir.join("map.hwpx");
+
+    // **같은 글자를 두 번** 넣는다 — 집합으로 맞추면 여기서 깨진다
+    const DUP: &str = "본문 한 줄.";
+    let spec = serde_json::json!({
+        "version": "1", "title": "지도",
+        "blocks": [
+            {"type": "heading", "level": 1, "text": "첫 장"},
+            {"type": "paragraph", "text": DUP},
+            {"type": "image", "path": png.to_string_lossy(), "widthMm": 60},
+            {"type": "paragraph", "text": "그림 1. 설명"},
+            {"type": "paragraph", "text": DUP},
+            {"type": "table", "rows": [["가", "나"], ["다", "라"]]},
+            {"type": "heading", "level": 2, "text": "둘째 절"},
+        ],
+    });
+    let r = hwp_core::create::create(&rhwp, &spec, &out, false)
+        .unwrap_or_else(|e| panic!("만들기: {e:#}"));
+
+    assert_eq!(r.blocks_at.len(), 7, "블록 7개가 다 보고돼야 한다: {:?}", r.blocks_at);
+    let kinds: Vec<&str> = r.blocks_at.iter().map(|b| b.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["heading", "paragraph", "image", "paragraph", "paragraph", "table", "heading"],
+        "블록 종류가 순서대로 나와야 한다"
+    );
+
+    // ---- 보고한 좌표가 **진짜 그 글자**인가
+    let t = Testimony::read(&out).expect("증인");
+    let text_at = |c: (u32, u32)| -> String {
+        t.body_paragraphs()
+            .into_iter()
+            .find(|p| (p.section, p.index.unwrap_or(u32::MAX)) == c)
+            .map(|p| hwp_core::offset::visible(&p.text).trim().to_string())
+            .unwrap_or_default()
+    };
+    let want_text = ["첫 장", DUP, "", "그림 1. 설명", DUP, "", "둘째 절"];
+    for (b, want) in r.blocks_at.iter().zip(want_text) {
+        if b.kind == "table" {
+            assert!(b.table.is_some(), "표 블록은 표 번호를 줘야 한다: {b:?}");
+            assert!(b.at.is_none(), "증인은 표의 앵커 단락을 모른다 — 지어내면 안 된다");
+            continue;
+        }
+        let at = b.at.unwrap_or_else(|| panic!("{} 블록에 좌표가 없다: {b:?}", b.kind));
+        if b.kind == "image" {
+            assert!(b.name.is_some(), "그림 블록은 부품 이름을 줘야 한다: {b:?}");
+            // 그림 단락에 그 그림이 정말 있는가
+            let imgs = hwp_core::images::read(&out).expect("그림");
+            assert!(
+                imgs.iter().any(|i| i.at == Some(at) && Some(&i.name) == b.name.as_ref()),
+                "보고한 자리 {at:?} 에 {:?} 가 없다",
+                b.name
+            );
+            continue;
+        }
+        assert_eq!(text_at(at), want, "{} 블록의 좌표 {at:?} 에 다른 글자가 있다", b.kind);
+    }
+
+    // ---- **같은 글자 두 개가 다른 자리로 갈려야 한다**
+    let dups: Vec<_> = r
+        .blocks_at
+        .iter()
+        .filter(|b| b.kind == "paragraph" && b.at.map(text_at).as_deref() == Some(DUP))
+        .filter_map(|b| b.at)
+        .collect();
+    assert_eq!(dups.len(), 2, "같은 글자 블록 둘이 다 보고돼야 한다: {dups:?}");
+    assert_ne!(
+        dups[0], dups[1],
+        "같은 글자인 두 블록이 **같은 좌표**로 보고됐다 — 집합으로 맞춘 것이다. \
+         앞에서부터 훑으면 순서대로 갈린다."
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -61,6 +61,11 @@ pub struct CreateReport {
     /// 조용히 넘기지 않기 위해 있다 — 받고 무시하는 것이 이 저장소가 가장
     /// 경계하는 꼴이다(사용자 보고 hwp-vi#7·#9 가 둘 다 그 모양이었다).
     pub warnings: Vec<String>,
+    /// **명세의 블록이 각각 어디로 갔는가.** 순서대로.
+    ///
+    /// 이게 없으면 부르는 쪽이 문서를 되읽어 글자로 짝을 맞춰야 한다 —
+    /// 실제로 그러고 계셨다(위 `BlockKind` 주석).
+    pub blocks_at: Vec<BlockAt>,
 }
 
 /// 명세에서 뽑은 "이렇게 되어야 한다".
@@ -77,9 +82,49 @@ struct Wanted {
     font_size_100pt: Option<u32>,
     /// 여백, HWPUNIT. 명세의 `margins_mm` 에서.
     margins: Option<Margins>,
+    /// 명세 `blocks` 의 **순서**. 만든 뒤 블록이 어디로 갔는지 돌려주는 데 쓴다.
+    order: Vec<BlockKind>,
     /// 그림 블록들. 백엔드의 `scaffold` 는 그림을 모르므로, 그 자리에
     /// **표지 글자**가 든 단락을 만들게 하고 만든 뒤 우리가 그림을 넣는다.
     images: Vec<WantedImage>,
+}
+
+/// 명세의 블록 하나가 **무엇이었는지**. 만든 뒤 "그 블록이 어디로 갔나" 를
+/// 돌려주려면 순서를 들고 있어야 한다.
+///
+/// 사용자 보고(2026-11-03): `create` 가 어느 블록이 몇 번 문단이 됐는지 말하지
+/// 않아서, 교재 원고를 만드시던 분이 **문서를 되읽어 글자로 짝을 맞추는** 코드를
+/// 직접 쓰셨다. 그 스크립트의 주석이 그대로 증언한다 — "create 가 넘긴 블록
+/// 순서와 문서 문단 번호는 다르다(제목 문단, 표가 끼어든다). 그래서 글자로 찾아
+/// 맞춘다." 같은 글자가 두 번 나오면 깨지는 방식이다.
+///
+/// 읽기 좌표와 쓰기 좌표가 맞아야 한다는 것은 이 저장소의 1번 이슈였다
+/// (`checks` 가 `tables` 에 없는 표를 가리켰다). 만들기 쪽에 같은 구멍이
+/// 남아 있었다.
+#[derive(Debug, Clone, Copy)]
+enum BlockKind {
+    /// `want.lines` 의 몇 번째 — 제목·문단
+    Line(usize),
+    /// `want.tables` 의 몇 번째
+    Table(usize),
+    /// `want.images` 의 몇 번째
+    Image(usize),
+}
+
+/// 블록 하나가 **어디로 갔는가**. 그 종류가 쓰는 좌표로 돌려준다 —
+/// 문단은 `(구역, 단락)`, 표는 표 번호(`set-cell` 이 받는 것).
+#[derive(Debug, Clone)]
+pub struct BlockAt {
+    /// 명세 `blocks` 의 순번
+    pub index: usize,
+    /// `heading` | `paragraph` | `table` | `image`
+    pub kind: String,
+    /// 본문 단락 좌표. 표 블록은 없다(증인이 표의 앵커 단락을 모른다).
+    pub at: Option<(u32, u32)>,
+    /// 표 번호 — 표 블록만.
+    pub table: Option<u32>,
+    /// 그림 부품 이름 — 그림 블록만.
+    pub name: Option<String>,
 }
 
 /// 명세의 `{"type":"image", …}` 하나.
@@ -196,6 +241,7 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
     let mut body_lines = Vec::new();
     let mut tables = Vec::new();
     let mut images: Vec<WantedImage> = Vec::new();
+    let mut order: Vec<BlockKind> = Vec::new();
     for (i, b) in blocks.iter().enumerate() {
         let kind = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match kind {
@@ -203,6 +249,7 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
                 let t = b.get("text").and_then(|t| t.as_str()).ok_or_else(|| {
                     anyhow::anyhow!("blocks[{i}] ({kind}) 에 `text` 가 없습니다")
                 })?;
+                order.push(BlockKind::Line(lines.len()));
                 lines.push(t.to_string());
                 if kind == "paragraph" {
                     body_lines.push(t.to_string());
@@ -236,6 +283,7 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
                         grid[bad].len()
                     );
                 }
+                order.push(BlockKind::Table(tables.len()));
                 tables.push(grid);
             }
             "image" => {
@@ -313,6 +361,7 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
                          (받는 것: left|center|right)"
                     ),
                 };
+                order.push(BlockKind::Image(images.len()));
                 images.push(WantedImage {
                     marker: image_marker(images.len()),
                     bytes,
@@ -330,7 +379,7 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
             ),
         }
     }
-    Ok(Wanted { lines, body_lines, tables, font_size_100pt, margins, images })
+    Ok(Wanted { lines, body_lines, tables, font_size_100pt, margins, images, order })
 }
 
 /// 미리보기 — **실제로 만들어 보고 버린다.**
@@ -495,6 +544,9 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result
     // HWPX 는 ZIP + XML 이므로 고칠 수 있다. 그리고 바로 아래에서 **증인이
     // 되읽어 대조**하므로, 우리가 쓴 것도 백엔드가 쓴 것과 같은 관문을
     // 지난다 — 읽을 수 있는 것만 쓰는 이유가 그것이다.
+    // 그림이 어느 단락으로 갔는지 · 부품 이름이 무엇인지 — 보고서가 쓴다
+    let mut image_at: Vec<Option<(u32, u32)>> = vec![None; want.images.len()];
+    let mut image_name: Vec<Option<String>> = vec![None; want.images.len()];
     // **그림을 넣는다.** 글자 크기·여백보다 먼저다 — 표지 단락을 글자로
     // 찾아야 하고, 글자 크기를 바꾸는 것은 글자를 바꾸지 않으므로 순서가
     // 상관없지만, 표지를 지운 뒤에 찾으면 찾을 수 없다.
@@ -523,6 +575,8 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result
         for (n, at) in spots {
             let im = &want.images[n];
             let part = crate::hwpx::next_bin_part(&pkg, &im.ext)?;
+            image_at[n] = Some(at);
+            image_name[n] = Some(part.clone());
             crate::hwpx::insert_image(
                 &mut pkg, at.0, at.1, &part, im.bytes.clone(),
                 im.width, im.height, im.inline,
@@ -637,10 +691,24 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result
         .iter()
         .map(|p| crate::offset::visible(&p.text))
         .collect();
+    // **같은 훑기가 지도도 만든다.** 글줄이 순서대로 있는지 보는 셈과 "그
+    // 글줄이 몇 번 단락이 됐나" 는 같은 질문이다 — 두 군데서 세면 어긋난다.
+    //
+    // 앞에서부터 훑으므로 **같은 글자가 두 번 나와도** 순서대로 갈린다.
+    // 되읽어 집합으로 맞추면 그게 깨진다(사용자가 그렇게 우회하고 계셨다).
+    let coords: Vec<(u32, u32)> = witness
+        .body_paragraphs()
+        .iter()
+        .map(|p| (p.section, p.index.unwrap_or(0)))
+        .collect();
+    let mut line_at: Vec<Option<(u32, u32)>> = vec![None; want.lines.len()];
     let mut at = 0usize;
     for (i, line) in want.lines.iter().enumerate() {
         match body[at..].iter().position(|b| b.trim() == line.trim()) {
-            Some(k) => at += k + 1,
+            Some(k) => {
+                line_at[i] = coords.get(at + k).copied();
+                at += k + 1;
+            }
             None => diffs.push(format!(
                 "명세 {i}번째 글줄이 본문에 없습니다 (이 순서로): {line:?}"
             )),
@@ -880,6 +948,41 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result
 
     Ok(CreateReport {
         path: dest.to_path_buf(),
+        blocks_at: want
+            .order
+            .iter()
+            .enumerate()
+            .map(|(i, b)| match b {
+                BlockKind::Line(n) => BlockAt {
+                    index: i,
+                    // 제목인지 본문인지는 `body_lines` 에 있는지로 가른다 —
+                    // `wanted_from` 이 본문만 거기 담는다.
+                    kind: if want.body_lines.iter().any(|t| Some(t) == want.lines.get(*n)) {
+                        "paragraph".into()
+                    } else {
+                        "heading".into()
+                    },
+                    at: line_at.get(*n).copied().flatten(),
+                    table: None,
+                    name: None,
+                },
+                BlockKind::Table(n) => BlockAt {
+                    index: i,
+                    kind: "table".into(),
+                    // 증인은 표의 앵커 단락을 모른다 — 지어내지 않는다.
+                    at: None,
+                    table: Some(*n as u32),
+                    name: None,
+                },
+                BlockKind::Image(n) => BlockAt {
+                    index: i,
+                    kind: "image".into(),
+                    at: image_at.get(*n).copied().flatten(),
+                    table: None,
+                    name: image_name.get(*n).cloned().flatten(),
+                },
+            })
+            .collect(),
         blocks,
         paragraphs: body.len(),
         tables: grids.len(),
