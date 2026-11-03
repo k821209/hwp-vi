@@ -117,7 +117,20 @@ pub enum Op {
     ///
     /// `.hwp`(CFB)는 **할 수 없다.** 우리에게 CFB 작성기가 없다 — 그쪽은
     /// `convert` 로 HWPX 로 바꾼 뒤 고치는 길이 있다.
-    SetParaAlign { at: Coord, align: crate::witness::ParaAlign },
+    SetParaStyle {
+        at: Coord,
+        align: Option<crate::witness::ParaAlign>,
+        /// 첫 줄 들여쓰기 (HWPUNIT). `rest` 보다 작으면 내어쓰기다.
+        ///
+        /// **단위를 재고 들어왔다** (실측 2026-11-03, HWPX 8개 문서의 `paraPr`
+        /// 615개): HWPX 는 `hp:switch` 안에 여백을 두 벌 적는데
+        /// `hp:default` = `hp:case` × 2 이고 **양쪽 다 `unit="HWPUNIT"` 이라고
+        /// 적혀 있다**. 속성을 믿고 한쪽만 쓰면 2배로 틀리고, 2배로 틀린
+        /// 들여쓰기는 "좀 이상한 문서" 로 보여 조용히 통과한다. 여기 값은
+        /// 증인이 읽는 단위(`hp:case` 쪽)이고 `hwpx` 가 배수를 맞춘다.
+        first_indent: Option<i64>,
+        rest_indent: Option<i64>,
+    },
     /// **그림을 넣는다 — 우리가 직접.** 백엔드에 해당 명령이 없다.
     ///
     /// 공개 이슈 #6. 백엔드의 `edit` 하위명령에 그림 넣기가 없어서, 이것을
@@ -162,6 +175,20 @@ pub enum Op {
         /// `SetParaAlign` 이다 — `hwp api` 의 `insert-image` 가 그렇게 내린다.
         align: crate::images::Align,
     },
+    /// **한 단락의 글자 크기를 바꾼다 — 우리가 직접.** 백엔드에 길이 없다.
+    ///
+    /// 사용자 보고(hwp-vi#5)의 `set-char` 중 크기. 백엔드의
+    /// `apply-char-format` 은 `--props` 의 `bold`·`italic`·`underline` 만
+    /// 듣는다(실측) — 크기를 줘도 아무 일도 일어나지 않는다.
+    ///
+    /// **글꼴 이름은 받지 않는다.** 증인이 구간의 글꼴 이름을 읽지 않으므로
+    /// 되읽어 대조할 수 없다. 확인할 수 없는 것을 쓰면 "걸었다" 고 말하고
+    /// 아무 일도 하지 않는 연산이 될 수 있고, 그걸 아무도 모른다.
+    ///
+    /// **구간이 아니라 문단 단위다.** 구간을 쪼개는 일은 따로이고, 이슈가 말한
+    /// 용도(장·절 제목과 캡션 구분)는 문단 단위로 선다. 부분 구간을 달라고 하면
+    /// 이유를 말하며 거부한다 — 조용히 문단 전체를 바꾸지 않는다.
+    SetCharSize { at: Coord, size_100pt: u32 },
     /// `edit delete-table` — 표를 지운다. **단락은 남는다.**
     ///
     /// 사용자 보고(2026-10-29): 다른 세션이 HWPX 의 zip 을 풀어 XML 을 직접
@@ -306,7 +333,7 @@ impl Op {
             ],
             // **우리가 직접 하는 연산은 백엔드 명령이 없다.** 재생 루프가
             // `local()` 을 보고 `apply_local` 로 보낸다.
-            Op::SetParaAlign { .. } | Op::InsertImage { .. } => Vec::new(),
+            Op::SetParaStyle { .. } | Op::InsertImage { .. } | Op::SetCharSize { .. } => Vec::new(),
             Op::SetDeco { at, offset, count, bold, italic, underline } => {
                 let mut props = serde_json::Map::new();
                 for (k, v) in [("bold", bold), ("italic", italic), ("underline", underline)] {
@@ -352,7 +379,7 @@ impl Op {
     ///   키는 값을 절반만 반영한다(실측). 그 위에 연산을 올릴 수 없었다.
     /// - 그림 넣기 — 백엔드에 **명령 자체가 없다**.
     pub fn local(&self) -> bool {
-        matches!(self, Op::SetParaAlign { .. } | Op::InsertImage { .. })
+        matches!(self, Op::SetParaStyle { .. } | Op::InsertImage { .. } | Op::SetCharSize { .. })
     }
 
     /// 우리 손으로 고친다. HWPX 만 된다.
@@ -375,8 +402,23 @@ impl Op {
         }
         let mut pkg = crate::hwpx::Package::open(src)?;
         match self {
-            Op::SetParaAlign { at, align } => {
-                crate::hwpx::set_para_align(&mut pkg, at.0, at.1, align.owpml())?;
+            Op::SetParaStyle { at, align, first_indent, rest_indent } => {
+                let indent = match (first_indent, rest_indent) {
+                    (None, None) => None,
+                    (Some(f), Some(r)) => Some((*f, *r)),
+                    // 한쪽만 온 것은 부르는 쪽(`expected`)이 메워 넣는다 —
+                    // 여기까지 오면 셈이 어긋난 것이므로 조용히 0 을 쓰지 않는다.
+                    _ => bail!(
+                        "들여쓰기가 한쪽만 왔습니다 (first {first_indent:?}, rest {rest_indent:?}) — \
+                         둘은 함께 `left`·`intent` 로 환산되므로 둘 다 있어야 합니다"
+                    ),
+                };
+                crate::hwpx::set_para_style(
+                    &mut pkg, at.0, at.1, align.map(|a| a.owpml()), indent,
+                )?;
+            }
+            Op::SetCharSize { at, size_100pt } => {
+                crate::hwpx::set_para_char_height(&mut pkg, at.0, at.1, *size_100pt)?;
             }
             Op::InsertImage { at, part, bytes, width, height, inline, align } => {
                 crate::hwpx::insert_image(
@@ -409,11 +451,23 @@ impl Op {
                     lines[0]
                 ),
             },
-            Op::SetParaAlign { at, align } => format!(
-                "구역{} 단락{} 의 정렬을 {}로",
-                at.0, at.1,
-                align.label()
-            ),
+            Op::SetParaStyle { at, align, first_indent, rest_indent } => {
+                let mut what: Vec<String> = Vec::new();
+                if let Some(a) = align {
+                    what.push(format!("정렬 {}", a.label()));
+                }
+                if let (Some(f), Some(r)) = (first_indent, rest_indent) {
+                    let mm = |v: i64| v as f64 / 7200.0 * 25.4;
+                    what.push(if f < r {
+                        format!("내어쓰기 (첫 줄 {:.1}mm · 나머지 {:.1}mm)", mm(*f), mm(*r))
+                    } else if f > r {
+                        format!("들여쓰기 (첫 줄 {:.1}mm · 나머지 {:.1}mm)", mm(*f), mm(*r))
+                    } else {
+                        format!("들여쓰기 {:.1}mm", mm(*f))
+                    });
+                }
+                format!("구역{} 단락{} 의 {}", at.0, at.1, what.join(" · "))
+            }
             Op::SetDeco { at, offset, count, bold, italic, underline } => {
                 let mut what: Vec<String> = Vec::new();
                 for (name, v) in [("진하게", bold), ("기울임", italic), ("밑줄", underline)] {
@@ -434,6 +488,11 @@ impl Op {
                 *width as f64 / 100.0,
                 *height as f64 / 100.0,
                 if *inline { "글자처럼" } else { "따로 놓기" }
+            ),
+            Op::SetCharSize { at, size_100pt } => format!(
+                "구역{} 단락{} 의 글자 크기를 {:.1}pt 로",
+                at.0, at.1,
+                *size_100pt as f64 / 100.0
             ),
             Op::DeleteTable { at, table } => {
                 format!("구역{} 단락{} 의 표{table} 지우기 (단락은 빈 채로 남습니다)", at.0, at.1)
@@ -588,7 +647,7 @@ pub struct Snapshot {
     pub deco: BTreeMap<Coord, Vec<String>>,
     /// 단락마다의 **정렬**. 문단서식은 `paraPr` 로 공유되므로 이것까지 들어야
     /// "한 단락만 바뀌었는가" 를 물을 수 있다.
-    pub styles: BTreeMap<Coord, crate::witness::ParaAlign>,
+    pub styles: BTreeMap<Coord, crate::witness::ParaStyle>,
     /// 정렬을 대조할 단락. `SetParaAlign` 이 **전부** 넣는다 — 공유 때문에
     /// 다른 단락이 같이 바뀌는 것이 이 연산의 주된 위험이다.
     pub styles_checked: std::collections::BTreeSet<Coord>,
@@ -603,6 +662,16 @@ pub struct Snapshot {
     /// 남는 구멍: 글자를 고치는 연산이 **다른 곳의** 꾸밈을 조용히 바꾸는
     /// 경우는 여전히 안 잡힌다. 적어 두고 다음에 본다.
     pub deco_checked: std::collections::BTreeSet<Coord>,
+    /// 보이는 글자마다의 **글자 크기**(1/100 pt).
+    ///
+    /// 꾸밈과 따로 드는 이유: 꾸밈은 백엔드가 걸고(그래서 모르는 키를 조용히
+    /// 무시하는 결함을 되읽어 잡아야 했다) 크기는 **우리가 XML 을 쓴다**.
+    /// 그리고 `charPr` 은 심하게 공유되므로(실측 c01: 한 종을 구간 24곳이
+    /// 쓴다) 제자리에서 고치면 문서 전체가 바뀐다 — 그게 이 연산의 주된
+    /// 위험이고, 그걸 보려면 **전부** 들어야 한다.
+    pub sizes: BTreeMap<Coord, Vec<u32>>,
+    /// 크기를 대조할 단락. `SetCharSize` 가 **전부** 넣는다(공유 때문).
+    pub sizes_checked: std::collections::BTreeSet<Coord>,
     /// **그림마다의 놓인 크기 · 글자처럼취급 · 바이트 수**, 단락마다 모아서.
     ///
 
@@ -701,6 +770,31 @@ pub fn deco_marks(p: &crate::witness::Para) -> Vec<String> {
     marks
 }
 
+/// 보이는 글자마다의 **크기**(1/100 pt). `deco_marks` 와 같은 기준이다 —
+/// 구간은 날 글자 기준이고 여기는 보이는 글자 기준이므로 한 칸씩 밀리지 않게
+/// 같은 환산을 쓴다.
+pub fn size_marks(p: &crate::witness::Para) -> Vec<u32> {
+    let raw: Vec<char> = p.text.chars().collect();
+    let mut to_visible = vec![usize::MAX; raw.len()];
+    let mut n = 0usize;
+    for (i, c) in raw.iter().enumerate() {
+        if *c != crate::offset::CONTROL {
+            to_visible[i] = n;
+            n += 1;
+        }
+    }
+    let mut marks = vec![0u32; n];
+    for r in &p.runs {
+        for i in r.start..(r.start + r.len).min(raw.len()) {
+            let v = to_visible[i];
+            if v != usize::MAX {
+                marks[v] = r.size_100pt;
+            }
+        }
+    }
+    marks
+}
+
 /// 지금 문서의 비교 단위를 뜬다. 저장 경로와 `hwp api` 가 **같은 것**을 본다 —
 /// 좌표 셈을 두 군데 두면 반드시 어긋난다.
 /// 그림들을 단락마다 모은다. 실패하면 **빈 표**를 돌려준다 — 그림을 못 읽는
@@ -739,7 +833,15 @@ pub fn snapshot(t: &Testimony, path: &Path) -> Snapshot {
     let styles = t
         .body_paragraphs()
         .into_iter()
-        .filter_map(|p| p.index.map(|i| ((p.section, i), p.style.align)))
+        .filter_map(|p| p.index.map(|i| ((p.section, i), p.style)))
+        .collect();
+    let sizes = t
+        .body_paragraphs()
+        .into_iter()
+        .filter_map(|p| {
+            let i = p.index?;
+            Some(((p.section, i), size_marks(&p)))
+        })
         .collect();
     let deco = t
         .body_paragraphs()
@@ -776,6 +878,8 @@ pub fn snapshot(t: &Testimony, path: &Path) -> Snapshot {
         styles_checked: Default::default(),
         deco,
         deco_checked: Default::default(),
+        sizes,
+        sizes_checked: Default::default(),
         images,
         images_elsewhere,
         images_checked: Default::default(),
@@ -998,6 +1102,7 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 // `changed` 에 서식을 실으면서 가짜 항목으로 드러났다
                 // (hwp-vi#8 을 고치다 찾았다).
                 cur.deco = shift(cur.deco, at.0, at.1, 1);
+                cur.sizes = shift(cur.sizes, at.0, at.1, 1);
                 cur.paras.insert(*at, String::new());
             }
             Op::InsertTextInCell { table, row, col, cell_para, offset, text } => {
@@ -1072,11 +1177,41 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 cur.images_checked = cur.images.keys().copied().collect();
                 cur.images_elsewhere_checked = true;
             }
-            Op::SetParaAlign { at, align } => {
+            Op::SetCharSize { at, size_100pt } => {
+                let marks = cur.sizes.get_mut(at).with_context(|| {
+                    format!("없는 단락의 글자 크기를 고치려 합니다: 구역{} 단락{}", at.0, at.1)
+                })?;
+                if marks.is_empty() {
+                    bail!(
+                        "구역{} 단락{} 에는 글자가 없습니다 — 크기를 걸 자리가 없습니다",
+                        at.0, at.1
+                    );
+                }
+                for m in marks.iter_mut() {
+                    *m = *size_100pt;
+                }
+                // **전부 대조한다.** `charPr` 은 심하게 공유되므로 제자리에서
+                // 고치면 다른 단락이 같이 바뀐다 — 그게 이 연산의 주된 위험이다.
+                cur.sizes_checked = cur.sizes.keys().copied().collect();
+            }
+            Op::SetParaStyle { at, align, first_indent, rest_indent } => {
                 if !cur.paras.contains_key(at) {
                     bail!("없는 단락입니다: 구역{} 단락{}", at.0, at.1);
                 }
-                cur.styles.insert(*at, *align);
+                if align.is_none() && first_indent.is_none() && rest_indent.is_none() {
+                    bail!("바꿀 것이 없습니다 — `align`·`firstIndent`·`restIndent` 중 하나는 주세요");
+                }
+                let mut st = cur.styles.get(at).copied().unwrap_or_default();
+                if let Some(a) = align {
+                    st.align = *a;
+                }
+                if let Some(f) = first_indent {
+                    st.first_indent = *f;
+                }
+                if let Some(r) = rest_indent {
+                    st.rest_indent = *r;
+                }
+                cur.styles.insert(*at, st);
                 // **모든 단락을 대조 대상에 넣는다.**
                 //
                 // `paraPr` 은 심하게 공유되므로(실측: 한 종을 79 문단이 쓴다)
@@ -1265,6 +1400,8 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 cur.images = shift(cur.images, at.0, at.1, -1);
                 cur.deco.remove(at);
                 cur.deco = shift(cur.deco, at.0, at.1, -1);
+                cur.sizes.remove(at);
+                cur.sizes = shift(cur.sizes, at.0, at.1, -1);
                 cur.styles.remove(at);
                 cur.styles = shift(cur.styles, at.0, at.1, -1);
             }
@@ -1404,11 +1541,27 @@ fn diff_report(
         let w = want.styles.get(at);
         let g = got.styles.get(at);
         if w != g {
+            // **어느 칸이 다른지 말한다.** 정렬 하나만 보던 때는 "정렬이
+            // 다릅니다" 로 충분했는데, 이제 들여쓰기까지 들므로 틀린 칸을
+            // 가리켜야 어디를 볼지 알 수 있다.
+            let say = |x: Option<&crate::witness::ParaStyle>| match x {
+                Some(st) => format!(
+                    "{} · 첫줄 {:.1}mm · 나머지 {:.1}mm",
+                    st.align.label(),
+                    st.first_indent as f64 / 7200.0 * 25.4,
+                    st.rest_indent as f64 / 7200.0 * 25.4
+                ),
+                None => "없음".to_string(),
+            };
+            let which = match (w, g) {
+                (Some(a), Some(b)) if a.align != b.align => "정렬",
+                (Some(a), Some(b)) if a.first_indent != b.first_indent => "첫 줄 들여쓰기",
+                (Some(a), Some(b)) if a.rest_indent != b.rest_indent => "나머지 줄 들여쓰기",
+                _ => "문단 서식",
+            };
             lines.push(format!(
-                "구역{} 단락{} 의 정렬이 다릅니다 — 기대 {} / 실제 {}",
-                at.0, at.1,
-                w.map(|a| a.label()).unwrap_or("없음"),
-                g.map(|a| a.label()).unwrap_or("없음")
+                "구역{} 단락{} 의 {which}이 다릅니다 — 기대 [{}] / 실제 [{}]",
+                at.0, at.1, say(w), say(g)
             ));
             break;
         }
@@ -1457,6 +1610,37 @@ fn diff_report(
             want.images_elsewhere.len(),
             got.images_elsewhere.len()
         ));
+    }
+
+    // **글자 크기가 그 단락만 바뀌었는가.**
+    //
+    // `charPr` 은 심하게 공유된다(실측 c01: 한 종을 구간 24곳이 쓴다). 제자리
+    // 에서 고치면 문서 전체의 글자 크기가 바뀌므로, 바꾼 단락만 보는 것으로는
+    // 모자라다 — 전부 넣어 두고 "하나만 바뀌었는가" 를 묻는다.
+    for at in &want.sizes_checked {
+        let w = want.sizes.get(at);
+        let g = got.sizes.get(at);
+        if w == g {
+            continue;
+        }
+        match (w, g) {
+            (Some(w), Some(g)) if w.len() == g.len() => {
+                let i = w.iter().zip(g).position(|(a, b)| a != b).unwrap_or(0);
+                lines.push(format!(
+                    "구역{} 단락{} 의 글자 크기가 다릅니다 — {i}번째 글자: 기대 {:.1}pt / 실제 {:.1}pt",
+                    at.0, at.1,
+                    w[i] as f64 / 100.0,
+                    g[i] as f64 / 100.0
+                ));
+            }
+            _ => lines.push(format!(
+                "구역{} 단락{} 의 글자 수가 달라 크기를 견줄 수 없습니다 — 기대 {:?}자 / 실제 {:?}자",
+                at.0, at.1,
+                w.map(|v| v.len()),
+                g.map(|v| v.len())
+            )),
+        }
+        break;
     }
 
     // **우리가 바꾸겠다고 말한 꾸밈은 들어갔는가.**
@@ -1669,6 +1853,8 @@ mod tests {
             styles_checked: Default::default(),
             deco: Default::default(),
             deco_checked: Default::default(),
+            sizes: Default::default(),
+            sizes_checked: Default::default(),
             images: Default::default(),
             images_elsewhere: Default::default(),
             images_checked: Default::default(),

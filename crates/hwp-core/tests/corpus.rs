@@ -4636,7 +4636,7 @@ fn changing_one_paragraphs_alignment_does_not_spread_to_others() {
     let to = if was == ParaAlign::Center { ParaAlign::Right } else { ParaAlign::Center };
 
     let mut log = hwp_core::edit::EditLog::new();
-    log.push(hwp_core::edit::Op::SetParaAlign { at: (0, target), align: to });
+    log.push(hwp_core::edit::Op::SetParaStyle { at: (0, target), align: Some(to), first_indent: None, rest_indent: None });
     hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("정렬 바꾸기: {e:#}"));
 
     let after = aligns(&doc);
@@ -4663,7 +4663,7 @@ fn changing_one_paragraphs_alignment_does_not_spread_to_others() {
     let cfb = dir.join("x.hwp");
     std::fs::copy(&out, &cfb).expect("복사");
     let mut log2 = hwp_core::edit::EditLog::new();
-    log2.push(hwp_core::edit::Op::SetParaAlign { at: (0, target), align: to });
+    log2.push(hwp_core::edit::Op::SetParaStyle { at: (0, target), align: Some(to), first_indent: None, rest_indent: None });
     let e = hwp_core::edit::save(&rhwp, &cfb, &log2).expect_err("`.hwp` 는 거부해야 한다");
     let msg = format!("{e:#}");
     assert!(
@@ -5247,4 +5247,327 @@ fn the_reported_image_alignment_is_the_one_that_places_it() {
         "글자처럼 취급하는 그림이 본문 단락에 올라앉은 표본이 코퍼스에 없다 — \
          실무 문서 그림 43개가 전부 그 꼴이므로, 못 덮으면 이 질문을 묻지 못한다"
     );
+}
+
+/// **들여쓰기를 쓰고, 두 포맷이 같은 값을 읽는지 본다** — hwp-vi#5.
+///
+/// 단위를 두 번 재야 하는 자리다. HWPX 는 `hp:switch` 안에 여백을 두 벌 적고
+/// (`hp:case`(HwpUnitChar) 와 `hp:default`), 실측으로 **`default` = `case` × 2**
+/// 인데 **양쪽 다 `unit="HWPUNIT"` 이라고 적혀 있다**. 속성을 믿으면 한쪽이
+/// 2배로 틀리고, 2배로 틀린 들여쓰기는 "좀 이상한 문서" 로 보여 조용히 통과한다.
+///
+/// 그래서 여기서는 쓴 뒤 **`.hwp` 로 변환해 양쪽을 견준다.** HWP5 판독기는
+/// 저장값을 2로 나눠 읽으므로(`PARA_SHAPE`), 같은 수가 나오면 환산이 양쪽에서
+/// 맞는다는 뜻이다.
+///
+/// 보증 범위: 이 시험이 보는 것은 `hp:case` 쪽이다. `hp:default` 는 우리
+/// 증인도 `rhwp` 도 읽지 않아(실측: 1배로 적어 보고 변환해도 결과가 같았다)
+/// 되읽기로 확인할 길이 없고, 그쪽은 생성된 XML 을 세는 단위 시험이 본다
+/// (`hwpx::indent_tests`).
+#[test]
+fn an_indent_we_write_reads_back_the_same_in_both_formats() {
+    let Some((rhwp, _)) = backend() else { return };
+    let Some(src) = samples()
+        .into_iter()
+        .find(|f| f.extension().and_then(|s| s.to_str()) == Some("hwpx"))
+    else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-ind-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+    let doc = dir.join(src.file_name().expect("이름"));
+    std::fs::copy(&src, &doc).expect("문서");
+
+    // 들여쓰기가 **없는** 단락을 고른다 — 바뀜이 보여야 한다
+    let t = Testimony::read(&doc).expect("증인");
+    let before = hwp_core::edit::snapshot(&t, &doc);
+    let Some((&at, _)) = before
+        .styles
+        .iter()
+        .find(|(c, st)| st.first_indent == 0 && st.rest_indent == 0 && before.paras.contains_key(c))
+    else {
+        eprintln!("건너뜀 — 들여쓰기 없는 본문 단락이 없다");
+        return;
+    };
+    // 10mm 내어쓰기 (첫 줄 0, 나머지 2835 HWPUNIT)
+    const REST: i64 = 2_835;
+    let mut log = hwp_core::edit::EditLog::new();
+    log.push(hwp_core::edit::Op::SetParaStyle {
+        at,
+        align: None,
+        first_indent: Some(0),
+        rest_indent: Some(REST),
+    });
+    hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("들여쓰기: {e:#}"));
+
+    let read_all = |p: &std::path::Path| -> std::collections::BTreeMap<(u32, u32), hwp_core::witness::ParaStyle> {
+        let t = Testimony::read(p).expect("증인");
+        hwp_core::edit::snapshot(&t, p).styles
+    };
+    let after = read_all(&doc);
+    let got = after.get(&at).copied().expect("그 단락");
+    assert_eq!(got.first_indent, 0, "첫 줄 들여쓰기가 다르다");
+    assert_eq!(got.rest_indent, REST, "나머지 줄 들여쓰기가 다르다");
+
+    // **다른 단락은 안 번졌는가.** `paraPr` 은 심하게 공유되므로 제자리에서
+    // 고치면 같이 바뀐다 — 그게 이 연산의 주된 위험이다.
+    for (c, b) in &before.styles {
+        if *c == at {
+            continue;
+        }
+        assert_eq!(
+            after.get(c).copied().map(|s| (s.first_indent, s.rest_indent)),
+            Some((b.first_indent, b.rest_indent)),
+            "구역{} 단락{} 의 들여쓰기가 함께 바뀌었다",
+            c.0, c.1
+        );
+    }
+
+    // ---- 두 포맷이 같은 값을 읽는가
+    let back = dir.join("back.hwp");
+    rhwp.run(&["convert", &doc.to_string_lossy(), &back.to_string_lossy(), "--verify"])
+        .unwrap_or_else(|e| panic!("백엔드가 우리가 쓴 들여쓰기를 거부했다: {e:#}"));
+    let hwp5 = read_all(&back);
+    let mut bad: Vec<String> = Vec::new();
+    for (c, a) in &after {
+        match hwp5.get(c) {
+            Some(b) if (a.first_indent, a.rest_indent) == (b.first_indent, b.rest_indent) => {}
+            Some(b) => bad.push(format!(
+                "구역{} 단락{}: HWPX ({}, {}) / HWP5 ({}, {})",
+                c.0, c.1, a.first_indent, a.rest_indent, b.first_indent, b.rest_indent
+            )),
+            None => bad.push(format!("구역{} 단락{} 이 HWP5 판에 없다", c.0, c.1)),
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "두 포맷의 들여쓰기가 어긋났다 — 환산이 한쪽에서 틀렸다는 뜻이다:\n  {}",
+        bad.join("\n  ")
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// HWPX 본문 단락마다의 `paraPrIDRef` — 표 칸 안(`hp:subList`)은 세지 않는다.
+///
+/// 시험이 이걸 직접 읽는 이유: **"같은 서식" 과 "같은 `paraPr` 번호" 는 다른
+/// 조건이다.** 번짐을 보려면 뒤쪽이어야 하고, 앞쪽으로 고르면 서식만 같고
+/// 번호는 다른 단락들을 짝으로 잡아 시험이 조용히 약해진다 — 실제로 그랬다.
+fn para_pr_ids(path: &std::path::Path) -> Vec<String> {
+    let Ok(f) = std::fs::File::open(path) else { return Vec::new() };
+    let Ok(mut z) = zip::ZipArchive::new(f) else { return Vec::new() };
+    let Ok(mut e) = z.by_name("Contents/section0.xml") else { return Vec::new() };
+    let mut xml = String::new();
+    use std::io::Read;
+    if e.read_to_string(&mut xml).is_err() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let b = xml.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'<' {
+            if b[i..].starts_with(b"<hp:subList") {
+                depth += 1;
+            } else if b[i..].starts_with(b"</hp:subList") {
+                depth -= 1;
+            } else if b[i..].starts_with(b"<hp:p ") || b[i..].starts_with(b"<hp:p>") {
+                if depth == 0 {
+                    let end = b[i..].iter().position(|c| *c == b'>').map(|k| i + k).unwrap_or(i);
+                    let tag = &xml[i..end];
+                    let key = "paraPrIDRef=\"";
+                    let id = tag
+                        .find(key)
+                        .and_then(|s| {
+                            let s = s + key.len();
+                            tag[s..].find('"').map(|e2| tag[s..s + e2].to_string())
+                        })
+                        .unwrap_or_default();
+                    out.push(id);
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// **문단 서식을 고칠 때 `paraPr` 을 베끼는가** — 제자리에서 고치면 그 번호를
+/// 쓰는 다른 단락이 **함께** 바뀐다.
+///
+/// 이 시험은 사보타주로 찾았다. `set_para_style` 이 새 번호를 매기지 않고
+/// 제자리에서 고치게 만들어도 **시험 78개가 전부 통과했다.** 번짐을 보는
+/// 시험이 하나 있었지만 "같은 정렬인 단락" 을 짝으로 골라서, 서식만 같고
+/// `paraPr` 번호는 다른 단락들을 잡고 있었다 — 묻는 질문이 아니었다.
+///
+/// 그래서 번호를 직접 읽어 **공유된 `paraPr`** 을 조건으로 찾는다. 그런
+/// 문서가 코퍼스에 없으면 통과 대신 터진다: 공유는 실무 문서의 기본값이고
+/// (실측: s03 의 한 종을 9 문단이 쓴다), 못 덮으면 이 질문을 묻지 못한다.
+#[test]
+fn editing_one_paragraphs_style_clones_the_shared_para_pr() {
+    let Some((rhwp, _)) = backend() else { return };
+    // **공유된 `paraPr`** 을 쓰는 단락을 찾는다
+    let Some((src, target, mates)) = samples()
+        .into_iter()
+        .filter(|f| f.extension().and_then(|s| s.to_str()) == Some("hwpx"))
+        .find_map(|f| {
+            let ids = para_pr_ids(&f);
+            ids.iter().enumerate().find_map(|(i, id)| {
+                if id.is_empty() {
+                    return None;
+                }
+                let mates: Vec<u32> = ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, x)| *j != i && *x == id)
+                    .map(|(j, _)| j as u32)
+                    .collect();
+                (mates.len() >= 2).then(|| (f.clone(), i as u32, mates))
+            })
+        })
+    else {
+        panic!(
+            "`paraPr` 을 셋 이상이 함께 쓰는 HWPX 가 코퍼스에 없다 — 공유는 실무 \
+             문서의 기본값이고(s03 의 한 종을 9 문단이 쓴다), 못 덮으면 \
+             \"번지지 않는가\" 를 묻지 못한다"
+        );
+    };
+
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-clone-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+    let doc = dir.join(src.file_name().expect("이름"));
+    std::fs::copy(&src, &doc).expect("문서");
+
+    let styles = |p: &std::path::Path| -> std::collections::BTreeMap<(u32, u32), hwp_core::witness::ParaStyle> {
+        let t = Testimony::read(p).expect("증인");
+        hwp_core::edit::snapshot(&t, p).styles
+    };
+    let before = styles(&doc);
+    let was = before.get(&(0, target)).copied().unwrap_or_default();
+
+    // 지금과 **다른** 값으로 바꾼다 — 안 바뀌면 번짐도 안 보인다
+    let want_rest = if was.rest_indent == 1_000 { 2_000 } else { 1_000 };
+    let mut log = hwp_core::edit::EditLog::new();
+    log.push(hwp_core::edit::Op::SetParaStyle {
+        at: (0, target),
+        align: None,
+        first_indent: Some(0),
+        rest_indent: Some(want_rest),
+    });
+    hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("서식 고치기: {e:#}"));
+
+    let after = styles(&doc);
+    assert_eq!(
+        after.get(&(0, target)).map(|s| s.rest_indent),
+        Some(want_rest),
+        "고치라고 한 단락이 안 바뀌었다"
+    );
+    // **짝들은 그대로여야 한다** — 이게 복제 장치가 사는 자리다
+    for m in &mates {
+        let b = before.get(&(0, *m)).copied();
+        let a = after.get(&(0, *m)).copied();
+        assert_eq!(
+            a.map(|s| (s.first_indent, s.rest_indent)),
+            b.map(|s| (s.first_indent, s.rest_indent)),
+            "단락 {m} 이 함께 바뀌었다 — 단락 {target} 과 같은 `paraPr` 을 쓰는데 \
+             제자리에서 고친 듯하다 (짝 {mates:?})"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **글자 크기를 바꾸고, 그 단락만 바뀌었는지 본다** — hwp-vi#5 의 `set-char`.
+///
+/// `charPr` 도 `paraPr` 처럼 심하게 공유된다(실측 c01.hwpx: 한 종을 구간
+/// 24곳이 쓴다). 제자리에서 고치면 **문서 전체의 글자 크기가 바뀌는데**
+/// 그래도 저장은 성공한다 — 그게 이 연산의 주된 위험이다.
+///
+/// 글꼴 이름은 쓰지 않는다. 증인이 구간의 글꼴 이름을 읽지 않으므로 되읽어
+/// 대조할 수 없고, 확인할 수 없는 것은 쓰지 않는다(`hwp api` 가 받되 그
+/// 이유를 말하며 거부한다).
+#[test]
+fn changing_one_paragraphs_char_size_does_not_spread_to_others() {
+    let Some((rhwp, _)) = backend() else { return };
+    // **공유된 `charPr`** 을 쓰는 단락이어야 번짐이 보인다. 크기가 같은
+    // 단락이 둘 이상인 문서를 조건으로 찾는다.
+    let sizes = |p: &std::path::Path| -> std::collections::BTreeMap<(u32, u32), Vec<u32>> {
+        let t = Testimony::read(p).expect("증인");
+        hwp_core::edit::snapshot(&t, p).sizes
+    };
+    let Some((src, target, mates)) = samples()
+        .into_iter()
+        .filter(|f| f.extension().and_then(|s| s.to_str()) == Some("hwpx"))
+        .find_map(|f| {
+            let s = sizes(&f);
+            s.iter().find_map(|(c, v)| {
+                let first = *v.first()?;
+                let mates: Vec<(u32, u32)> = s
+                    .iter()
+                    .filter(|(d, w)| *d != c && w.first() == Some(&first) && !w.is_empty())
+                    .map(|(d, _)| *d)
+                    .collect();
+                (mates.len() >= 2).then(|| (f.clone(), *c, mates))
+            })
+        })
+    else {
+        panic!(
+            "같은 글자 크기인 본문 단락이 셋 이상인 HWPX 가 코퍼스에 없다 — \
+             `charPr` 공유는 실무 문서의 기본값이고(c01 의 한 종을 구간 24곳이 \
+             쓴다), 못 덮으면 \"번지지 않는가\" 를 묻지 못한다"
+        );
+    };
+
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-size-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+    let doc = dir.join(src.file_name().expect("이름"));
+    std::fs::copy(&src, &doc).expect("문서");
+
+    let before = sizes(&doc);
+    let was = before[&target][0];
+    let want = if was == 2_000 { 1_100 } else { 2_000 };
+
+    let mut log = hwp_core::edit::EditLog::new();
+    log.push(hwp_core::edit::Op::SetCharSize { at: target, size_100pt: want });
+    hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("크기 바꾸기: {e:#}"));
+
+    let after = sizes(&doc);
+    let got = after.get(&target).expect("그 단락");
+    assert!(
+        got.iter().all(|&x| x == want),
+        "단락 {target:?} 의 글자 크기가 전부 {:.1}pt 가 아니다: {:?}",
+        want as f64 / 100.0,
+        got
+    );
+    assert_eq!(
+        got.len(),
+        before[&target].len(),
+        "글자 수가 달라졌다 — 크기만 바꿔야 한다"
+    );
+    // **짝들은 그대로여야 한다**
+    for m in &mates {
+        assert_eq!(
+            after.get(m),
+            before.get(m),
+            "단락 {m:?} 의 글자 크기가 함께 바뀌었다 — `charPr` 을 제자리에서 \
+             고친 듯하다 (짝 {mates:?})"
+        );
+    }
+    // 글자는 하나도 안 바뀌어야 한다
+    let t = Testimony::read(&doc).expect("증인");
+    let paras = hwp_core::edit::snapshot(&t, &doc).paras;
+    for (c, b) in &before {
+        let _ = b;
+        assert!(paras.contains_key(c), "단락 {c:?} 이 사라졌다");
+    }
+
+    // 백엔드가 받는가
+    let back = dir.join("back.hwp");
+    rhwp.run(&["convert", &doc.to_string_lossy(), &back.to_string_lossy(), "--verify"])
+        .unwrap_or_else(|e| panic!("백엔드가 우리가 쓴 글자 크기를 거부했다: {e:#}"));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

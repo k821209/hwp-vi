@@ -121,7 +121,7 @@ fn yes() -> bool {
 ///
 /// 손으로 적는 목록이라 어긋날 수 있다 — 그래서 시험이 `Op::local()` 과
 /// 맞는지 본다(`hwpx_only_matches_the_ops_we_write_ourselves`).
-pub const HWPX_ONLY_OPS: &[&str] = &["set-para-align", "insert-image"];
+pub const HWPX_ONLY_OPS: &[&str] = &["set-para-style", "insert-image", "set-char"];
 
 pub const READS: &[&str] = &[
     "text", "outline", "tables", "styles", "deco", "images", "levels", "symbols", "checks", "page",
@@ -252,7 +252,18 @@ pub enum OpSpec {
     /// **HWPX 만 된다.** 백엔드의 `apply-para-format` 을 못 믿어서(모르는 키를
     /// 조용히 무시하고 값을 절반만 반영한다 — 실측) 우리가 XML 을 고치는데,
     /// `.hwp`(CFB)는 작성기가 없다. `convert` 로 바꾼 뒤 고치면 된다.
-    SetParaAlign { section: u32, para: u32, align: String },
+    #[serde(alias = "set-para-align")]
+    SetParaStyle {
+        section: u32,
+        para: u32,
+        align: Option<String>,
+        /// 첫 줄 들여쓰기 (HWPUNIT, `read:["styles"]` 가 주는 그 단위).
+        /// `restIndent` 보다 작으면 **내어쓰기**다 — 공문서 글머리가 쓰는 꼴.
+        #[serde(rename = "firstIndent", alias = "first_indent")]
+        first_indent: Option<i64>,
+        #[serde(rename = "restIndent", alias = "rest_indent")]
+        rest_indent: Option<i64>,
+    },
     /// **그림을 넣는다** — 그 단락의 첫 구간 안에 놓는다.
     ///
     /// 사용자 보고(hwp-vi#6). 백엔드의 `edit` 에 그림 넣기가 **없어서**, 이것을
@@ -292,6 +303,29 @@ pub enum OpSpec {
         ///
         /// `inline: false` 면 떠 있는 그림이므로 `hp:pos/@horzAlign` 에 쓴다.
         align: Option<String>,
+    },
+    /// **글자 크기를 바꾼다** — 그 단락 전체.
+    ///
+    /// 사용자 보고(hwp-vi#5)의 `set-char`. 두 가지를 **받되 거부한다** —
+    /// serde 가 "모르는 칸" 으로 끝내면 받는 쪽은 왜인지 모르고 오타인 줄
+    /// 알고 다시 보낸다(`set-deco` 의 `strike` 와 같은 처리다).
+    ///
+    /// - `font` — 증인이 구간의 글꼴 이름을 **읽지 않는다.** 되읽어 대조할
+    ///   수 없는 것을 쓰면 "걸었다" 고 말하고 아무 일도 하지 않는 연산이 될
+    ///   수 있고, 그걸 아무도 모른다.
+    /// - `offset`·`count` — 구간을 쪼개는 일은 따로다. 조용히 문단 전체를
+    ///   바꾸지 않는다.
+    ///
+    /// **HWPX 만.** 백엔드의 `apply-char-format` 은 `bold`·`italic`·
+    /// `underline` 만 듣는다(실측) — 크기를 줘도 아무 일도 일어나지 않는다.
+    SetChar {
+        section: u32,
+        para: u32,
+        #[serde(rename = "sizePt", alias = "size_pt")]
+        size_pt: Option<f64>,
+        font: Option<String>,
+        offset: Option<usize>,
+        count: Option<usize>,
     },
     /// 글머리 단계를 올리거나 내린다 (`Tab` / `Shift-Tab`)
     Relevel { section: u32, para: u32, delta: isize },
@@ -454,10 +488,12 @@ pub const CAPS: &[Cap] = &[
         ex: &[],
     },
     Cap {
-        id: "set-para-align",
-        what: "문단 정렬을 바꾼다 (justify|left|right|center|distribute|division) — \
-               **HWPX 만**. 좌표는 `styles` 가 준다",
-        machine: Machine::Op("set-para-align"),
+        id: "set-para-style",
+        what: "문단 서식을 바꾼다 — 정렬(justify|left|right|center|distribute|division)과 \
+               들여쓰기(`firstIndent`·`restIndent`, HWPUNIT). `firstIndent < restIndent` 가 \
+               내어쓰기다. 좌표와 단위는 `styles` 가 주는 것과 같다. **HWPX 만** \
+               (옛 이름 `set-para-align` 도 받는다)",
+        machine: Machine::Op("set-para-style"),
         ex: &[],
     },
     Cap {
@@ -465,6 +501,25 @@ pub const CAPS: &[Cap] = &[
         what: "그림을 단락에 넣는다 — 크기는 mm, 한쪽만 주면 나머지는 그림 \
                비율에서 온다. **HWPX 만**",
         machine: Machine::Op("insert-image"),
+        ex: &[],
+    },
+    Cap {
+        id: "set-char",
+        what: "한 단락의 글자 크기를 바꾼다 (`sizePt`) — **HWPX 만**. 크기는 \
+               `deco` 가 구간마다 돌려주는 `sizePt` 와 같은 값이다. 글꼴 이름과 \
+               부분 구간은 받되 이유를 말하며 거부한다",
+        machine: Machine::Op("set-char"),
+        ex: &[],
+    },
+    Cap {
+        // **옛 이름도 자기서술에 적는다.** serde 가 받는 이름이면 받는 쪽이
+        // 거기서 찾을 수 있어야 한다 — 시험이 바로 그걸 본다
+        // (`every_edit_op_appears_in_the_self_description`). 조용히 받기만
+        // 하면 옛 이름을 쓰는 쪽은 새 이름이 생긴 줄 모른다.
+        id: "set-para-align",
+        what: "`set-para-style` 의 옛 이름 — 그대로 받는다. 새 이름은 들여쓰기도 \
+               함께 받으므로 그쪽을 쓰라",
+        machine: Machine::Op("set-para-align"),
         ex: &[],
     },
     Cap {
@@ -818,7 +873,7 @@ fn reject_unwritable(s: &str, where_: &str) -> anyhow::Result<()> {
             _ => continue,
         };
         anyhow::bail!(
-            "{where_} 의 {i}번째에 {name} 가 있다 — 쓸 수 없다.\n               문단을 나누려면 `lines` 를 써라 (예: \"lines\": [\"첫 문단\", \"둘째 문단\"]).\n               이 글자들은 한글이 어떻게 그리는지 확인되지 않았고, 증인이 공백으로 \
+            "{where_} 의 {i}번째에 {name} 가 있다 — 쓸 수 없다.\n 문단을 나누려면 `lines` 를 써라 (예: \"lines\": [\"첫 문단\", \"둘째 문단\"]).\n 이 글자들은 한글이 어떻게 그리는지 확인되지 않았고, 증인이 공백으로 \
              읽어서 응답과 파일이 어긋난다."
         );
     }
@@ -1433,7 +1488,8 @@ fn op_name(spec: &OpSpec) -> &'static str {
         OpSpec::Check { .. } => "check",
         OpSpec::CheckInCell { .. } => "check-in-cell",
         OpSpec::SetDeco { .. } => "set-deco",
-        OpSpec::SetParaAlign { .. } => "set-para-align",
+        OpSpec::SetParaStyle { .. } => "set-para-style",
+        OpSpec::SetChar { .. } => "set-char",
         OpSpec::InsertImage { .. } => "insert-image",
         OpSpec::Relevel { .. } => "relevel",
         OpSpec::InsertTable { .. } => "insert-table",
@@ -1810,22 +1866,111 @@ fn lower(
                 Some(format!("표{index} 가 된다 ({rows}×{cols})")),
             )
         }
-        OpSpec::SetParaAlign { section, para, align } => {
+        OpSpec::SetChar { section, para, size_pt, font, offset, count } => {
+            text_at(*section, *para)?;
+            if font.is_some() {
+                anyhow::bail!(
+                    "글꼴 이름은 바꿀 수 없다 — 증인이 구간의 글꼴 이름을 **읽지 않으므로** 되읽어 대조할 수 없다. 확인할 수 없는 것을 쓰면 \"걸었다\" 고 말하고 아무 일도 하지 않는 연산이 되고, 그걸 아무도 모른다. 문서 전체의 글꼴은 `create` 의 `font` 로 정한다."
+                );
+            }
+            if offset.is_some() || count.is_some() {
+                anyhow::bail!(
+                    "글자 크기는 **단락 단위**로만 바꾼다 — 구간을 쪼개는 일은 아직 없다. `offset`·`count` 를 조용히 무시하고 문단 전체를 바꾸지 않는다. 부분 구간에 걸 수 있는 것은 지금 `set-deco`(진하게·기울임·밑줄)뿐이다."
+                );
+            }
+            let Some(pt) = size_pt else {
+                anyhow::bail!("`sizePt` 를 주라 — 지금 받는 것은 그것뿐이다");
+            };
+            if !(pt.is_finite() && *pt > 0.0) {
+                anyhow::bail!("`sizePt` 가 양수가 아니다: {pt}");
+            }
+            // 1/100 pt — 증인이 `sizePt` 를 그 단위에서 환산해 돌려준다
+            let h = (pt * 100.0).round() as u32;
+            if h == 0 {
+                anyhow::bail!("`sizePt` 가 0.01pt 보다 작다: {pt}");
+            }
+            let now = cur
+                .sizes
+                .get(&(*section, *para))
+                .and_then(|v| v.first().copied());
+            (
+                vec![Op::SetCharSize { at: (*section, *para), size_100pt: h }],
+                now.map(|was| {
+                    format!("{:.1}pt → {:.1}pt (단락 전체)", was as f64 / 100.0, pt)
+                }),
+            )
+        }
+        OpSpec::SetParaStyle { section, para, align, first_indent, rest_indent } => {
             text_at(*section, *para)?;
             use hwp_core::witness::ParaAlign;
-            let a = match align.trim().to_lowercase().as_str() {
-                "justify" => ParaAlign::Justify,
-                "left" => ParaAlign::Left,
-                "right" => ParaAlign::Right,
-                "center" => ParaAlign::Center,
-                "distribute" => ParaAlign::Distribute,
-                "division" => ParaAlign::Division,
-                other => anyhow::bail!(
-                    "모르는 정렬이다: {other:?} \
-                     (받는 것: justify, left, right, center, distribute, division)"
-                ),
+            let a = match align.as_deref().map(|s| s.trim().to_lowercase()) {
+                None => None,
+                Some(v) => Some(match v.as_str() {
+                    "justify" => ParaAlign::Justify,
+                    "left" => ParaAlign::Left,
+                    "right" => ParaAlign::Right,
+                    "center" => ParaAlign::Center,
+                    "distribute" => ParaAlign::Distribute,
+                    "division" => ParaAlign::Division,
+                    other => anyhow::bail!(
+                        "모르는 정렬이다: {other:?} \
+                         (받는 것: justify, left, right, center, distribute, division)"
+                    ),
+                }),
             };
-            (vec![Op::SetParaAlign { at: (*section, *para), align: a }], None)
+            if a.is_none() && first_indent.is_none() && rest_indent.is_none() {
+                anyhow::bail!(
+                    "바꿀 것을 주라 — `align`·`firstIndent`·`restIndent` 중 하나는 있어야 한다"
+                );
+            }
+            for (k, v) in [("firstIndent", first_indent), ("restIndent", rest_indent)] {
+                if let Some(x) = v {
+                    if *x < 0 {
+                        anyhow::bail!(
+                            "{k} 가 음수다 ({x}) — 내어쓰기는 `firstIndent < restIndent` 로 적는다 (예: 첫 줄 0, 나머지 2400)"
+                        );
+                    }
+                }
+            }
+            // **한쪽만 주면 나머지는 지금 값에서 온다.** 둘은 함께
+            // `left`·`intent` 로 환산되므로(증인 공식의 역) 한쪽만으로는
+            // 쓸 수 없다. 모르는 값을 0 으로 메우면 멀쩡해 보이는 채로
+            // 반대쪽 들여쓰기를 날린다.
+            let now = cur.styles.get(&(*section, *para)).copied();
+            let (fi, ri) = match (first_indent, rest_indent) {
+                (None, None) => (None, None),
+                (Some(f), Some(r)) => (Some(*f), Some(*r)),
+                (Some(f), None) => {
+                    let st = now.ok_or_else(|| anyhow::anyhow!(
+                        "구역{section} 단락{para} 의 지금 들여쓰기를 모른다 — `restIndent` 도 함께 주라"
+                    ))?;
+                    (Some(*f), Some(st.rest_indent))
+                }
+                (None, Some(r)) => {
+                    let st = now.ok_or_else(|| anyhow::anyhow!(
+                        "구역{section} 단락{para} 의 지금 들여쓰기를 모른다 — `firstIndent` 도 함께 주라"
+                    ))?;
+                    (Some(st.first_indent), Some(*r))
+                }
+            };
+            let said = match (fi, ri) {
+                (Some(f), Some(r)) if f != r => Some(format!(
+                    "{} — 첫 줄 {:.1}mm, 나머지 {:.1}mm",
+                    if f < r { "내어쓰기" } else { "들여쓰기" },
+                    f as f64 / 7200.0 * 25.4,
+                    r as f64 / 7200.0 * 25.4
+                )),
+                _ => None,
+            };
+            (
+                vec![Op::SetParaStyle {
+                    at: (*section, *para),
+                    align: a,
+                    first_indent: fi,
+                    rest_indent: ri,
+                }],
+                said,
+            )
         }
         OpSpec::InsertImage { section, para, path, width_mm, height_mm, inline, align } => {
             text_at(*section, *para)?;
@@ -1918,7 +2063,12 @@ fn lower(
                         Align::Right => ParaAlign::Right,
                         Align::Left => ParaAlign::Left,
                     };
-                    ops.push(Op::SetParaAlign { at: (*section, *para), align: pa });
+                    ops.push(Op::SetParaStyle {
+                        at: (*section, *para),
+                        align: Some(pa),
+                        first_indent: None,
+                        rest_indent: None,
+                    });
                     let has_text = !cur
                         .paras
                         .get(&(*section, *para))
@@ -2195,17 +2345,36 @@ fn diff_json(
                 let wb = before.styles.get(&oa);
                 let wa = after.styles.get(&new_at);
                 if wb != wa {
-                    let name = |x: Option<&hwp_core::witness::ParaAlign>| {
-                        x.map(|a| format!("{a:?}").to_lowercase())
+                    let mut o = Map::new();
+                    o.insert("kind".into(), json!("style"));
+                    o.insert("change".into(), json!("edited"));
+                    o.insert("at".into(), json!(format!("{sec}:{new_i}")));
+                    o.insert("section".into(), json!(sec));
+                    o.insert("para".into(), json!(new_i));
+                    // **바뀐 칸만 적는다.** 보낸 것을 되돌려 주는 것이 아니라
+                    // 바뀐 것을 말한다 — `align` 만 준 요청에 들여쓰기가
+                    // 딸려 나오면 받는 쪽이 그걸 변경으로 읽는다.
+                    let al = |x: Option<&hwp_core::witness::ParaStyle>| {
+                        x.map(|s| format!("{:?}", s.align).to_lowercase())
                     };
-                    out.push(json!({
-                        "kind": "style",
-                        "change": "edited",
-                        "at": format!("{sec}:{new_i}"),
-                        "section": sec,
-                        "para": new_i,
-                        "align": {"before": name(wb), "after": name(wa)},
-                    }));
+                    if wb.map(|s| s.align) != wa.map(|s| s.align) {
+                        o.insert("align".into(), json!({"before": al(wb), "after": al(wa)}));
+                    }
+                    if wb.map(|s| s.first_indent) != wa.map(|s| s.first_indent) {
+                        o.insert(
+                            "firstIndent".into(),
+                            json!({"before": wb.map(|s| s.first_indent),
+                                   "after": wa.map(|s| s.first_indent)}),
+                        );
+                    }
+                    if wb.map(|s| s.rest_indent) != wa.map(|s| s.rest_indent) {
+                        o.insert(
+                            "restIndent".into(),
+                            json!({"before": wb.map(|s| s.rest_indent),
+                                   "after": wa.map(|s| s.rest_indent)}),
+                        );
+                    }
+                    out.push(Value::Object(o));
                 }
 
                 if let (Some(db), Some(da)) = (before.deco.get(&oa), after.deco.get(&new_at)) {
@@ -2835,8 +3004,8 @@ mod tests {
         // 늘려야 하고, 늘리지 않으면 아래 단정이 알려 준다.
         let local: Vec<(&str, bool)> = vec![
             (
-                "set-para-align",
-                Op::SetParaAlign { at: (0, 0), align: ParaAlign::Center }.local(),
+                "set-para-style",
+                Op::SetParaStyle { at: (0, 0), align: Some(ParaAlign::Center), first_indent: None, rest_indent: None }.local(),
             ),
             (
                 "set-deco",

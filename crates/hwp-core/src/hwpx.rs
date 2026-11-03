@@ -244,7 +244,97 @@ pub fn set_char_height(pkg: &mut Package, ids: &[String], height_100pt: u32) -> 
 ///
 /// 단락 번호는 **본문 단락 순번**이다 — 표 셀 안 단락(`hp:subList` 안)은 세지
 /// 않는다. 증인의 `index` 와 같은 기준이어야 좌표가 통한다.
-pub fn set_para_align(pkg: &mut Package, section: u32, para: u32, horizontal: &str) -> Result<()> {
+/// **`hh:margin` 의 들여쓰기를 고친다 — `hp:switch` 두 가지에 각각.**
+///
+/// 실측(2026-11-03, HWPX 8개 문서의 `paraPr` 615개): 0 이 아닌 544건 중
+/// **540건에서 `hp:default` = `hp:case` × 2** 가 정확히 성립한다. 어긋난 4건은
+/// 반올림이다(default -361 → case -181, 1201 → 600, 1 → 0). 즉 `hp:default`
+/// 가 저장값이고 `hp:case`(HwpUnitChar)는 그 절반이다.
+///
+/// **두 가지 다 `unit="HWPUNIT"` 이라고 적혀 있다.** 값이 2배 차이인데
+/// 단위 속성은 같은 말을 한다 — 속성을 믿으면 한쪽이 2배로 틀린다. 그리고
+/// **2배로 틀린 들여쓰기는 "좀 이상한 문서" 로 보여 조용히 통과한다.**
+///
+/// 증인은 `hp:case` 쪽을 HWPUNIT 으로 읽고, 그 값이 조판기와 맞는 것은 이미
+/// 시험이 본다(`witness_first_indent_agrees_with_the_typesetter`). 그래서
+/// 여기 받는 `left`·`intent` 도 그 단위이고, `hp:default` 에는 2배로 적는다.
+/// 우리가 쓸 때는 `V` 와 `2V` 를 함께 적으므로 반올림 오차가 없다.
+///
+/// ## `hp:default` 는 되읽어 확인할 수 없다 — 그래도 쓴다
+///
+/// 실측(2026-11-03): `hp:default` 에 일부러 1배로 적어 보고 `.hwp` 로 변환해
+/// 양쪽을 읽어 봤는데 **결과가 같았다**. 즉 우리 증인도, 백엔드 `rhwp` 도
+/// `hp:case` 만 읽는다. 이 묶음을 검증할 도구가 우리에게 없다.
+///
+/// 이 저장소의 규칙은 "읽지 못하는 것은 쓰지 않는다" 인데 여기서는 **안 쓰는
+/// 것이 더 나쁘다.** 베껴 온 `paraPr` 의 그 묶음에는 **옛 값이 남아 있고**,
+/// 그러면 두 벌이 서로 다른 들여쓰기를 말한다 — `hp:default` 를 읽는 쪽(옛
+/// 한글, 다른 도구)이 옛 값을 본다.
+///
+/// 그래서 쓰고, 보호는 되읽기 대신 **생성된 XML 을 보는 단위 시험**에 맡긴다
+/// (`들여쓰기는_두_묶음에_1배와_2배로_적힌다`). `hp:pic` 의 크기 일곱 자리와
+/// 같은 꼴이다 — 두 벌이 어긋나는 것은 문서의 사고가 아니라 코드 결함이므로,
+/// 막는 자리도 문서가 아니라 코드다.
+fn set_margin_indent(para_pr: &str, left: i64, intent: i64) -> Result<String> {
+    let mut out = String::with_capacity(para_pr.len() + 32);
+    let mut rest = para_pr;
+    let mut branches = 0usize;
+    // `hp:case` / `hp:default` 묶음마다 배수를 달리 적용한다. 바이트로 찾는다 —
+    // 태그 이름은 ASCII 이고, 사이에 한글이 있어도 자르는 자리는 안전하다.
+    while let Some(at) = rest.find("<hp:case").or_else(|| rest.find("<hp:default")) {
+        let is_case = rest[at..].starts_with("<hp:case");
+        let close = if is_case { "</hp:case>" } else { "</hp:default>" };
+        let Some(end) = rest[at..].find(close).map(|k| at + k + close.len()) else {
+            break;
+        };
+        let body = &rest[at..end];
+        // **HwpUnitChar 가 아닌 `hp:case` 는 재 보지 않았다.** 조용히 1배로
+        // 쓰면 그 묶음이 2배로 틀린다 — 멈추고 말한다.
+        let scale = if is_case {
+            let head_end = body.find('>').unwrap_or(0);
+            if !body[..head_end].contains("HwpUnitChar") {
+                bail!(
+                    "모르는 `hp:case` 묶음입니다 — `HwpUnitChar` 가 아닙니다. 단위를 재지 않았으므로 쓰지 않습니다: {}",
+                    &body[..head_end.min(160)]
+                );
+            }
+            1
+        } else {
+            2
+        };
+        out.push_str(&rest[..at]);
+        let (b1, h1) = set_attr(body, "<hc:left", "value", &(left * scale).to_string(), false);
+        let (b2, h2) = set_attr(&b1, "<hc:intent", "value", &(intent * scale).to_string(), false);
+        if h1 == 0 || h2 == 0 {
+            bail!("`hh:margin` 에 `hc:left`·`hc:intent` 가 없습니다 (left {h1}건, intent {h2}건)");
+        }
+        out.push_str(&b2);
+        rest = &rest[end..];
+        branches += 1;
+    }
+    out.push_str(rest);
+    // **두 벌이 다 있어야 한다.** 한쪽만 고치면 다른 쪽이 옛 값으로 남고,
+    // 한글이 어느 쪽을 읽느냐에 따라 결과가 갈린다.
+    if branches < 2 {
+        bail!(
+            "`hp:switch` 의 묶음을 {branches}개만 찾았습니다 — `hp:case`(HwpUnitChar)와 `hp:default` 두 벌이 다 있어야 합니다. 한쪽만 고치면 한글이 읽는 쪽에 따라 들여쓰기가 2배로 틀립니다."
+        );
+    }
+    Ok(out)
+}
+
+/// 문단 서식을 고친다 — 정렬과 들여쓰기. **`paraPr` 을 한 번만 베낀다.**
+///
+/// 정렬과 들여쓰기를 따로 부르면 `paraPr` 이 두 벌 복제되고, 그래도 결과는
+/// 맞지만 서식 표가 쓸데없이 불어난다. 한 연산에서 같이 받는다.
+pub fn set_para_style(
+    pkg: &mut Package,
+    section: u32,
+    para: u32,
+    horizontal: Option<&str>,
+    // `(first_indent, rest_indent)` — HWPUNIT, 증인이 읽는 그 단위.
+    indent: Option<(i64, i64)>,
+) -> Result<()> {
     let sec_name = format!("Contents/section{section}.xml");
     let Some(sec) = pkg.text(&sec_name) else {
         bail!("구역 {section} 이 없습니다 ({sec_name})");
@@ -326,9 +416,23 @@ pub fn set_para_align(pkg: &mut Package, section: u32, para: u32, horizontal: &s
     }
     let new_id = max_id + 1;
 
-    let (mut fresh, hits) = set_attr(&base, "<hh:align", "horizontal", horizontal, false);
-    if hits == 0 {
-        bail!("`paraPr` {old_id} 에 `hh:align/@horizontal` 이 없습니다");
+    let mut fresh = base.clone();
+    if let Some(h) = horizontal {
+        let (next, hits) = set_attr(&fresh, "<hh:align", "horizontal", h, false);
+        if hits == 0 {
+            bail!("`paraPr` {old_id} 에 `hh:align/@horizontal` 이 없습니다");
+        }
+        fresh = next;
+    }
+    if let Some((first, rest_i)) = indent {
+        // 증인의 공식을 되돌린다: `first = left + max(intent,0)`,
+        // `rest = left + max(-intent,0)` 이므로 `left = min(first, rest)` 이고
+        // `intent = first - rest` 다. (s03 paraPr 69 로 확인: left 1330 ·
+        // intent -2040 → first 1330 · rest 3370.)
+        if first < 0 || rest_i < 0 {
+            bail!("들여쓰기는 음수일 수 없습니다 (first {first}, rest {rest_i}) — 내어쓰기는 `firstIndent < restIndent` 로 적습니다");
+        }
+        fresh = set_margin_indent(&fresh, first.min(rest_i), first - rest_i)?;
     }
     let (f2, idh) = set_attr(&fresh, "<hh:paraPr", "id", &new_id.to_string(), false);
     if idh == 0 {
@@ -356,6 +460,151 @@ pub fn set_para_align(pkg: &mut Package, section: u32, para: u32, horizontal: &s
     sec2.replace_range(abs..abs + e, &new_id.to_string());
     pkg.set_text(&sec_name, sec2);
     Ok(())
+}
+
+/// **한 본문 단락의 글자 크기를 바꾼다 — 그 단락만.**
+///
+/// 사용자 보고(hwp-vi#5)의 `set-char` 중 크기. 글꼴 이름은 **쓰지 않는다** —
+/// 증인이 구간의 글꼴 이름을 읽지 않으므로 되읽어 대조할 수 없고, 이 저장소는
+/// 확인할 수 없는 것을 쓰지 않는다. 크기는 증인이 구간마다 읽는다(`sizePt`).
+///
+/// `charPr` 도 `paraPr` 처럼 **심하게 공유된다** — 실측(c01.hwpx): `charPr 0`
+/// 하나를 구간 24곳이 쓴다. 그래서 제자리에서 고치면 문서 전체의 글자 크기가
+/// 바뀐다. `paraPr` 과 같은 복제 장치를 쓴다: 그 단락이 쓰는 `charPr` 마다
+/// 베껴 `height` 만 바꾸고, 새 번호로 넣고, **그 단락의 구간들만** 새 번호를
+/// 가리키게 한다.
+///
+/// **문단 자기 수준의 구간만** 센다. 표 칸 안(`hp:subList` → `hp:p` →
+/// `hp:run`)까지 바꾸면 말하지 않은 것을 바꾼다 — 그림을 넣을 때 같은 자리에서
+/// 한 번 당했다.
+pub fn set_para_char_height(
+    pkg: &mut Package,
+    section: u32,
+    para: u32,
+    height_100pt: u32,
+) -> Result<usize> {
+    if height_100pt == 0 {
+        bail!("글자 크기가 0 입니다");
+    }
+    let sec_name = format!("Contents/section{section}.xml");
+    let Some(sec) = pkg.text(&sec_name) else {
+        bail!("구역 {section} 이 없습니다 ({sec_name})");
+    };
+    let (p_start, p_end) = find_body_para(&sec, para)?;
+
+    // ---- 1) 그 단락 자기 수준의 `hp:run` 들과 그 charPrIDRef 자리
+    //
+    // `(절대 시작, 절대 끝)` 을 모은다 — 나중에 뒤에서부터 갈아 끼우려면
+    // 자리를 알아야 하고, 앞에서부터 바꾸면 뒤 자리가 밀린다.
+    let mut spots: Vec<(usize, usize, String)> = Vec::new();
+    {
+        let body = &sec[p_start..p_end];
+        let b = body.as_bytes();
+        let mut depth = 0i32;
+        let mut i = 0usize;
+        while i < b.len() {
+            if b[i] == b'<' {
+                if b[i..].starts_with(b"<hp:subList") {
+                    depth += 1;
+                } else if b[i..].starts_with(b"</hp:subList") {
+                    depth -= 1;
+                } else if depth == 0 && b[i..].starts_with(b"<hp:run") {
+                    let end = b[i..].iter().position(|c| *c == b'>').map(|k| i + k).unwrap_or(i);
+                    let tag = &body[i..end];
+                    let key = "charPrIDRef=\"";
+                    if let Some(s0) = tag.find(key) {
+                        let s0 = s0 + key.len();
+                        if let Some(e0) = tag[s0..].find('"') {
+                            spots.push((
+                                p_start + i + s0,
+                                p_start + i + s0 + e0,
+                                tag[s0..s0 + e0].to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    if spots.is_empty() {
+        bail!(
+            "구역 {section} 단락 {para} 에 (표 밖의) `hp:run` 이 없습니다 — \
+             글자가 없는 단락인 듯합니다"
+        );
+    }
+
+    // ---- 2) 쓰이는 `charPr` 마다 베껴 `height` 를 바꾼다
+    let hdr_name = "Contents/header.xml";
+    let Some(mut hdr) = pkg.text(hdr_name) else {
+        bail!("{hdr_name} 이 없습니다");
+    };
+    let mut max_id = 0u32;
+    {
+        let mut rest = hdr.as_str();
+        while let Some(at) = rest.find("<hh:charPr id=\"") {
+            let s2 = at + "<hh:charPr id=\"".len();
+            if let Some(e2) = rest[s2..].find('"') {
+                if let Ok(v) = rest[s2..s2 + e2].parse::<u32>() {
+                    max_id = max_id.max(v);
+                }
+            }
+            rest = &rest[s2..];
+        }
+    }
+
+    let mut mapping: BTreeMap<String, String> = BTreeMap::new();
+    let mut added = 0u32;
+    let distinct: Vec<String> = {
+        let mut v: Vec<String> = spots.iter().map(|(_, _, id)| id.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    for old_id in distinct {
+        let open = format!("<hh:charPr id=\"{old_id}\"");
+        let Some(cs) = hdr.find(&open) else {
+            bail!("`charPr` {old_id} 를 {hdr_name} 에서 찾지 못했습니다");
+        };
+        let Some(ce) = hdr[cs..].find("</hh:charPr>").map(|k| cs + k + "</hh:charPr>".len()) else {
+            bail!("`charPr` {old_id} 가 닫히지 않았습니다");
+        };
+        let base = hdr[cs..ce].to_string();
+        added += 1;
+        let new_id = max_id + added;
+        let (f1, h1) = set_attr(&base, "<hh:charPr", "height", &height_100pt.to_string(), false);
+        if h1 == 0 {
+            bail!("`charPr` {old_id} 에 `height` 속성이 없습니다");
+        }
+        let (f2, h2) = set_attr(&f1, "<hh:charPr", "id", &new_id.to_string(), false);
+        if h2 == 0 {
+            bail!("새 `charPr` 의 번호를 적지 못했습니다");
+        }
+        hdr.insert_str(ce, &f2);
+        mapping.insert(old_id, new_id.to_string());
+    }
+
+    // `itemCnt` 를 올린다 — 수가 안 맞으면 한글이 거부할 수 있다
+    let cnt_key = "<hh:charProperties itemCnt=\"";
+    let Some(qs) = hdr.find(cnt_key) else {
+        bail!("`hh:charProperties` 를 찾지 못했습니다");
+    };
+    let qs = qs + cnt_key.len();
+    let Some(qe) = hdr[qs..].find('"').map(|k| qs + k) else {
+        bail!("`itemCnt` 를 읽을 수 없습니다");
+    };
+    let cnt: u32 = hdr[qs..qe].parse().unwrap_or(0);
+    hdr.replace_range(qs..qe, &(cnt + added).to_string());
+    pkg.set_text(hdr_name, hdr);
+
+    // ---- 3) 그 단락의 구간들이 새 번호를 가리키게 — **뒤에서부터**
+    let mut sec2 = sec.clone();
+    for (s0, e0, old_id) in spots.iter().rev() {
+        let Some(new_id) = mapping.get(old_id) else { continue };
+        sec2.replace_range(*s0..*e0, new_id);
+    }
+    pkg.set_text(&sec_name, sec2);
+    Ok(spots.len())
 }
 
 /// 패키지에 부품을 **새로** 넣는다. 다시 묶을 때 순서에 들어간다.
@@ -659,6 +908,83 @@ mod tests {
         assert_eq!(mm_to_hwpunit(25.0), 7087);
         assert_eq!(mm_to_hwpunit(15.0), 4252);
         assert_eq!(mm_to_hwpunit(210.0), 59528);
+    }
+}
+
+#[cfg(test)]
+mod indent_tests {
+    use super::*;
+
+    /// **들여쓰기는 `hp:switch` 두 묶음에 1배와 2배로 적힌다.**
+    ///
+    /// 실측(HWPX 8개 문서의 `paraPr` 615개): 0 이 아닌 544건 중 540건에서
+    /// `hp:default` = `hp:case` × 2. 어긋난 4건은 반올림이다. 양쪽 다
+    /// `unit="HWPUNIT"` 이라고 적혀 있으므로 **속성을 믿으면 한쪽이 2배로
+    /// 틀린다.**
+    ///
+    /// 되읽기로는 못 잡는다 — 우리 증인도 `rhwp` 도 `hp:case` 만 읽는다
+    /// (`hp:default` 에 1배로 적어 보고 `.hwp` 로 변환해 확인했다: 결과가
+    /// 같았다). 그래서 여기서 센다.
+    const SWITCHED: &str = concat!(
+        r#"<hh:paraPr id="3" tabPrIDRef="0"><hh:align horizontal="JUSTIFY" vertical="BASELINE"/>"#,
+        r#"<hp:switch>"#,
+        r#"<hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar">"#,
+        r#"<hh:margin><hc:intent value="0" unit="HWPUNIT"/><hc:left value="0" unit="HWPUNIT"/>"#,
+        r#"<hc:right value="0" unit="HWPUNIT"/></hh:margin>"#,
+        r#"<hh:lineSpacing type="PERCENT" value="160" unit="HWPUNIT"/></hp:case>"#,
+        r#"<hp:default>"#,
+        r#"<hh:margin><hc:intent value="0" unit="HWPUNIT"/><hc:left value="0" unit="HWPUNIT"/>"#,
+        r#"<hc:right value="0" unit="HWPUNIT"/></hh:margin>"#,
+        r#"<hh:lineSpacing type="PERCENT" value="160" unit="HWPUNIT"/></hp:default>"#,
+        r#"</hp:switch></hh:paraPr>"#,
+    );
+
+    #[test]
+    fn 들여쓰기는_두_묶음에_1배와_2배로_적힌다() {
+        // 내어쓰기: 첫 줄 0, 나머지 2835 → left = 0, intent = -2835
+        let out = set_margin_indent(SWITCHED, 0, -2835).expect("적기");
+        let branches: Vec<&str> = out
+            .split("<hp:")
+            .filter(|b| b.starts_with("case") || b.starts_with("default"))
+            .collect();
+        assert_eq!(branches.len(), 2, "묶음이 둘이어야 한다\n{out}");
+        assert!(
+            branches[0].contains(r#"<hc:intent value="-2835""#),
+            "hp:case 는 1배여야 한다\n{}", branches[0]
+        );
+        assert!(
+            branches[1].contains(r#"<hc:intent value="-5670""#),
+            "hp:default 는 2배여야 한다 — 같은 수를 쓰면 그쪽을 읽는 도구에서 \
+             들여쓰기가 절반이 된다\n{}", branches[1]
+        );
+        // 손대지 않은 속성은 그대로
+        assert_eq!(out.matches(r#"<hc:right value="0""#).count(), 2, "{out}");
+        assert_eq!(out.matches(r#"value="160""#).count(), 2, "줄 간격을 건드렸다\n{out}");
+    }
+
+    /// **두 벌이 다 있어야 쓴다.** 한쪽만 고치면 다른 쪽에 옛 값이 남고,
+    /// 한글이 어느 쪽을 읽느냐에 따라 결과가 갈린다 — 조용히.
+    #[test]
+    fn 묶음이_하나뿐이면_거부한다() {
+        let one = SWITCHED
+            .replace(r#"<hp:default>"#, "<!--")
+            .replace("</hp:default>", "-->");
+        let e = set_margin_indent(&one, 0, -100).expect_err("거부해야 한다");
+        assert!(format!("{e}").contains("두 벌"), "{e}");
+    }
+
+    /// 모르는 `hp:case` 묶음은 **멈춘다.** 조용히 1배로 쓰면 그 묶음이
+    /// 2배로 틀리는데, 단위를 재지 않은 묶음에 대고 추측할 수 없다.
+    #[test]
+    fn 모르는_case_묶음이면_멈춘다() {
+        let odd = SWITCHED.replace(
+            "http://www.hancom.co.kr/hwpml/2016/HwpUnitChar",
+            "http://example.com/other",
+        );
+        let e = set_margin_indent(&odd, 0, -100).expect_err("거부해야 한다");
+        let m = format!("{e}");
+        assert!(m.contains("HwpUnitChar"), "{m}");
+        assert!(m.contains("재지 않았"), "{m}");
     }
 }
 
