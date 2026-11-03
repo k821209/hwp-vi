@@ -869,7 +869,99 @@ pub fn insert_image(
     let mut sec2 = sec.clone();
     sec2.insert_str(p_start + run_end_rel, &pic);
     pkg.set_text(&sec_name, sec2);
+    // **그 줄을 그림이 들어갈 만큼 키운다.** 안 하면 그림이 아래를 덮는다.
+    if inline {
+        grow_line_for(pkg, section, para, height)?;
+    }
     Ok(part.to_string())
+}
+
+/// **글자처럼 취급하는 그림이 들어간 줄의 저장 높이를 그림에 맞춘다.**
+///
+/// 안 하면 **그림이 아래 내용을 덮는다.** 눈으로 보고 찾았다 — 11pt 본문에
+/// 127pt 그림을 넣었더니 캡션과 표가 그림 뒤에 깔렸고, 저장된 줄은 여전히
+/// `vertsize="1000"`(10pt)이었다. 조판기는 **저장된 줄을 재현**하므로 10pt
+/// 자리에 127pt 그림을 그린다.
+///
+/// **`layout-anomaly` 는 이것을 못 본다.** 겹침 0, 글자겹침 0 을 보고했다 —
+/// 그림은 글자 런이 아니라서 그 검사의 대상이 아니다. 기계 검사가 통과한
+/// 자리를 눈이 잡은 경우다.
+///
+/// 값은 실측으로 정했다. 실무 문서에서 그림이 든 단락 8건 **전부**:
+///
+/// | 문서 | 그림 높이 | `vertsize` | `textheight` | `baseline` |
+/// |---|---|---|---|---|
+/// | s03 | 1885 | 1885 | 1885 | 1602 (0.85) |
+/// | p   | 3291 | 3291 | 3291 | 2797 (0.85) |
+///
+/// 즉 `vertsize = textheight = 그림 높이`, `baseline = 높이 × 0.85`. 글자만
+/// 있는 줄도 같은 0.85 비율이었다(2000 → 1700).
+///
+/// `spacing`·`horzsize` 는 건드리지 않는다 — 실측에서 그림 높이와 관계가
+/// 보이지 않았고(같은 높이에 240 과 984 가 둘 다 있다), 재지 않은 값을
+/// 지어내지 않는다.
+fn grow_line_for(pkg: &mut Package, section: u32, para: u32, height: u32) -> Result<()> {
+    let name = format!("Contents/section{section}.xml");
+    let Some(xml) = pkg.text(&name) else {
+        bail!("구역 {section} 이 없습니다 ({name})");
+    };
+    let (p_start, p_end) = find_body_para(&xml, para)?;
+    let body = &xml[p_start..p_end];
+    // 그 단락 **자기 수준**의 `hp:lineseg` 만 — 표 칸 안의 줄은 남의 것이다
+    let mut depth = 0i32;
+    let mut spots: Vec<(usize, usize)> = Vec::new();
+    let b = body.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'<' {
+            if b[i..].starts_with(b"<hp:subList") {
+                depth += 1;
+            } else if b[i..].starts_with(b"</hp:subList") {
+                depth -= 1;
+            } else if depth == 0 && b[i..].starts_with(b"<hp:lineseg") {
+                if let Some(e) = b[i..].iter().position(|c| *c == b'>') {
+                    spots.push((i, i + e + 1));
+                }
+            }
+        }
+        i += 1;
+    }
+    if spots.is_empty() {
+        // 저장된 줄이 없는 문서도 있다(조판 부기를 안 들고 있는 생성물).
+        // 그때는 조판기가 스스로 계산하므로 할 일이 없다.
+        return Ok(());
+    }
+    let baseline = ((height as f64) * 0.85).round() as u32;
+    let mut out = String::with_capacity(xml.len() + 32);
+    out.push_str(&xml[..p_start]);
+    let mut last = 0usize;
+    for (s0, e0) in &spots {
+        out.push_str(&body[last..*s0]);
+        let tag = &body[*s0..*e0];
+        // **이미 더 큰 줄은 줄이지 않는다.** 한 줄에 그림이 둘이면 큰 쪽이
+        // 줄 높이를 정한다 — 뒤에 넣은 작은 그림이 앞의 큰 그림을 깎으면
+        // 그 그림이 다시 아래를 덮는다.
+        let now = tag
+            .find("vertsize=\"")
+            .and_then(|k| {
+                let k = k + "vertsize=\"".len();
+                tag[k..].find('"').and_then(|e| tag[k..k + e].parse::<u32>().ok())
+            })
+            .unwrap_or(0);
+        if now >= height {
+            out.push_str(tag);
+        } else {
+            let (t1, _) = set_attr(tag, "<hp:lineseg", "vertsize", &height.to_string(), false);
+            let (t2, _) = set_attr(&t1, "<hp:lineseg", "textheight", &height.to_string(), false);
+            let (t3, _) = set_attr(&t2, "<hp:lineseg", "baseline", &baseline.to_string(), false);
+            out.push_str(&t3);
+        }
+        last = *e0;
+    }
+    out.push_str(&body[last..]);
+    out.push_str(&xml[p_end..]);
+    pkg.set_text(&name, out);
+    Ok(())
 }
 
 /// 본문 단락 하나의 XML 범위 (`<hp:p …>` … `</hp:p>`).

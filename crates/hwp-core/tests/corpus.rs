@@ -5958,3 +5958,105 @@ fn setting_a_paragraphs_font_is_verified_by_reading_it_back() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **넣은 그림이 아래 내용을 덮지 않는가** — 렌더 기하로 본다.
+///
+/// 눈으로 보고 찾은 결함이다. 11pt 본문에 127pt 그림을 넣었더니 캡션과 표가
+/// 그림 뒤에 깔렸는데, 저장된 줄은 여전히 `vertsize="1000"`(10pt)이었다.
+/// 조판기는 **저장된 줄을 재현**하므로 10pt 자리에 127pt 그림을 그린다.
+///
+/// **`layout-anomaly` 는 이것을 못 본다** — 실측으로 확인했다: 겹침 0,
+/// 글자겹침 0 을 보고했다. 그림은 글자 런이 아니라서 그 검사의 대상이
+/// 아니다. 증인도 못 본다(조판 기하를 읽지 않는다). 그래서 **렌더 트리의
+/// bbox** 로 묻는다 — 그림 아래끝보다 다음 글자가 위에 있으면 덮는 것이다.
+///
+/// 줄 높이 값은 실측으로 정했다: 실무 문서의 그림 단락 8건 전부
+/// `vertsize = textheight = 그림 높이`, `baseline = 높이 × 0.85`.
+#[test]
+fn an_inserted_image_does_not_cover_what_follows_it() {
+    let Some((rhwp, _)) = backend() else { return };
+    let exe = rhwp.bin().to_path_buf();
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-cover-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+    let png = dir.join("tall.png");
+    // **세로로 긴 그림** — 한 줄 높이로는 절대 담기지 않는다
+    image::RgbImage::from_fn(40, 120, |_, y| image::Rgb([40, (y * 2) as u8, 160]))
+        .save(&png)
+        .expect("PNG");
+
+    let out = dir.join("doc.hwpx");
+    let spec = serde_json::json!({
+        "version": "1", "title": "덮는지 본다",
+        "font_size_pt": 11,
+        "blocks": [
+            {"type": "paragraph", "text": "그림 위의 글."},
+            {"type": "image", "path": png.to_string_lossy(), "widthMm": 60},
+            {"type": "paragraph", "text": "그림 아래의 글. 이것이 가려지면 안 된다."},
+        ],
+    });
+    hwp_core::create::create(&rhwp, &spec, &out, false).unwrap_or_else(|e| panic!("만들기: {e:#}"));
+
+    // ---- 렌더 기하를 받는다. `export-render-tree` 는 **CWD 의 `output/`** 에
+    //      쓰고 경로를 바꿀 수 없으므로, 임시 폴더에서 실행한다.
+    let ok = std::process::Command::new(&exe)
+        .current_dir(&dir)
+        .args(["export-render-tree", &out.to_string_lossy()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("건너뜀 — 렌더 트리를 뽑지 못했다");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let tree = dir.join("output/render_tree_001.json");
+    let raw = std::fs::read_to_string(&tree).expect("렌더 트리");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("JSON");
+
+    // 모든 노드의 (종류, bbox) 를 모은다
+    fn walk(o: &serde_json::Value, out: &mut Vec<(String, f64, f64)>) {
+        if let Some(m) = o.as_object() {
+            if let (Some(t), Some(b)) = (m.get("type").and_then(|x| x.as_str()), m.get("bbox")) {
+                if let (Some(y), Some(h)) = (
+                    b.get("y").and_then(|x| x.as_f64()),
+                    b.get("h").and_then(|x| x.as_f64()),
+                ) {
+                    out.push((t.to_string(), y, h));
+                }
+            }
+            for x in m.values() {
+                walk(x, out);
+            }
+        } else if let Some(a) = o.as_array() {
+            for x in a {
+                walk(x, out);
+            }
+        }
+    }
+    let mut nodes = Vec::new();
+    walk(&v, &mut nodes);
+
+    let img = nodes
+        .iter()
+        .find(|(t, _, _)| t.contains("Image"))
+        .unwrap_or_else(|| panic!("렌더 트리에 그림이 없다: {:?}", nodes));
+    let img_bottom = img.1 + img.2;
+    // 그림보다 **아래에서 시작하는** 글자 중 가장 위의 것
+    let next = nodes
+        .iter()
+        .filter(|(t, y, _)| t.to_lowercase().contains("text") && *y > img.1)
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+    if let Some((_, y, _)) = next {
+        assert!(
+            *y >= img_bottom - 1.0,
+            "그림이 아래 글을 덮는다 — 그림 아래끝 {img_bottom:.0}, 다음 글자 y={y:.0}. \
+             저장된 줄(`hp:lineseg/@vertsize`)이 그림 높이보다 작은 것이다."
+        );
+    } else {
+        panic!("그림 아래에 글자가 없다 — 이 시험이 묻는 것을 묻지 못한다");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
