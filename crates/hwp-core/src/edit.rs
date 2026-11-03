@@ -130,6 +130,16 @@ pub enum Op {
         /// 증인이 읽는 단위(`hp:case` 쪽)이고 `hwpx` 가 배수를 맞춘다.
         first_indent: Option<i64>,
         rest_indent: Option<i64>,
+        /// 문단 **위** 간격 (HWPUNIT, 1 pt = 100).
+        ///
+        /// 제목이 본문에 붙어 보이는 것이 품질 불만의 큰 몫이었다. 실측
+        /// (실무 문서 `paraPr` 604개): 위 간격을 쓰는 것이 20%(흔한 값
+        /// 500·1000·300 = 5·10·3pt), 아래 간격이 8%.
+        ///
+        /// 쓸 수 있게 된 근거는 **증인이 읽게 됐기 때문**이다 — 두 포맷을
+        /// 견줘 확인했다(단락 318개, 어긋남 0, 그중 205개가 간격을 가진다).
+        space_before: Option<i64>,
+        space_after: Option<i64>,
     },
     /// **그림을 넣는다 — 우리가 직접.** 백엔드에 해당 명령이 없다.
     ///
@@ -413,7 +423,7 @@ impl Op {
         }
         let mut pkg = crate::hwpx::Package::open(src)?;
         match self {
-            Op::SetParaStyle { at, align, first_indent, rest_indent } => {
+            Op::SetParaStyle { at, align, first_indent, rest_indent, space_before, space_after } => {
                 let indent = match (first_indent, rest_indent) {
                     (None, None) => None,
                     (Some(f), Some(r)) => Some((*f, *r)),
@@ -424,8 +434,15 @@ impl Op {
                          둘은 함께 `left`·`intent` 로 환산되므로 둘 다 있어야 합니다"
                     ),
                 };
+                let space = match (space_before, space_after) {
+                    (None, None) => None,
+                    (Some(b), Some(a)) => Some((*b, *a)),
+                    _ => bail!(
+                        "문단 간격이 한쪽만 왔습니다 (위 {space_before:?}, 아래 {space_after:?}) —                          둘은 같은 `hh:margin` 에 함께 적히므로 둘 다 있어야 합니다"
+                    ),
+                };
                 crate::hwpx::set_para_style(
-                    &mut pkg, at.0, at.1, align.map(|a| a.owpml()), indent,
+                    &mut pkg, at.0, at.1, align.map(|a| a.owpml()), indent, space,
                 )?;
             }
             Op::SetChar { at, size_100pt, font } => {
@@ -464,10 +481,13 @@ impl Op {
                     lines[0]
                 ),
             },
-            Op::SetParaStyle { at, align, first_indent, rest_indent } => {
+            Op::SetParaStyle { at, align, first_indent, rest_indent, space_before, space_after } => {
                 let mut what: Vec<String> = Vec::new();
                 if let Some(a) = align {
                     what.push(format!("정렬 {}", a.label()));
+                }
+                if let (Some(b), Some(a)) = (space_before, space_after) {
+                    what.push(format!("간격 위 {:.1}pt · 아래 {:.1}pt", *b as f64 / 100.0, *a as f64 / 100.0));
                 }
                 if let (Some(f), Some(r)) = (first_indent, rest_indent) {
                     let mm = |v: i64| v as f64 / 7200.0 * 25.4;
@@ -1277,12 +1297,20 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                     cur.fonts_checked = cur.fonts.keys().copied().collect();
                 }
             }
-            Op::SetParaStyle { at, align, first_indent, rest_indent } => {
+            Op::SetParaStyle { at, align, first_indent, rest_indent, space_before, space_after } => {
                 if !cur.paras.contains_key(at) {
                     bail!("없는 단락입니다: 구역{} 단락{}", at.0, at.1);
                 }
-                if align.is_none() && first_indent.is_none() && rest_indent.is_none() {
-                    bail!("바꿀 것이 없습니다 — `align`·`firstIndent`·`restIndent` 중 하나는 주세요");
+                if align.is_none()
+                    && first_indent.is_none()
+                    && rest_indent.is_none()
+                    && space_before.is_none()
+                    && space_after.is_none()
+                {
+                    bail!(
+                        "바꿀 것이 없습니다 — `align`·`firstIndent`·`restIndent`·\
+                         `spaceBeforePt`·`spaceAfterPt` 중 하나는 주세요"
+                    );
                 }
                 let mut st = cur.styles.get(at).copied().unwrap_or_default();
                 if let Some(a) = align {
@@ -1293,6 +1321,12 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 }
                 if let Some(r) = rest_indent {
                     st.rest_indent = *r;
+                }
+                if let Some(b) = space_before {
+                    st.space_before = *b;
+                }
+                if let Some(a) = space_after {
+                    st.space_after = *a;
                 }
                 cur.styles.insert(*at, st);
                 // **모든 단락을 대조 대상에 넣는다.**
@@ -1631,10 +1665,12 @@ fn diff_report(
             // 가리켜야 어디를 볼지 알 수 있다.
             let say = |x: Option<&crate::witness::ParaStyle>| match x {
                 Some(st) => format!(
-                    "{} · 첫줄 {:.1}mm · 나머지 {:.1}mm",
+                    "{} · 첫줄 {:.1}mm · 나머지 {:.1}mm · 위 {:.1}pt · 아래 {:.1}pt",
                     st.align.label(),
                     st.first_indent as f64 / 7200.0 * 25.4,
-                    st.rest_indent as f64 / 7200.0 * 25.4
+                    st.rest_indent as f64 / 7200.0 * 25.4,
+                    st.space_before as f64 / 100.0,
+                    st.space_after as f64 / 100.0
                 ),
                 None => "없음".to_string(),
             };
@@ -1642,6 +1678,8 @@ fn diff_report(
                 (Some(a), Some(b)) if a.align != b.align => "정렬",
                 (Some(a), Some(b)) if a.first_indent != b.first_indent => "첫 줄 들여쓰기",
                 (Some(a), Some(b)) if a.rest_indent != b.rest_indent => "나머지 줄 들여쓰기",
+                (Some(a), Some(b)) if a.space_before != b.space_before => "문단 위 간격",
+                (Some(a), Some(b)) if a.space_after != b.space_after => "문단 아래 간격",
                 _ => "문단 서식",
             };
             lines.push(format!(

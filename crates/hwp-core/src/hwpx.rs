@@ -275,7 +275,13 @@ pub fn set_char_height(pkg: &mut Package, ids: &[String], height_100pt: u32) -> 
 /// (`들여쓰기는_두_묶음에_1배와_2배로_적힌다`). `hp:pic` 의 크기 일곱 자리와
 /// 같은 꼴이다 — 두 벌이 어긋나는 것은 문서의 사고가 아니라 코드 결함이므로,
 /// 막는 자리도 문서가 아니라 코드다.
-fn set_margin_indent(para_pr: &str, left: i64, intent: i64) -> Result<String> {
+fn set_margin_indent(
+    para_pr: &str,
+    left: i64,
+    intent: i64,
+    // 문단 위·아래 간격 (HWPUNIT). `None` 이면 건드리지 않는다.
+    space: Option<(i64, i64)>,
+) -> Result<String> {
     let mut out = String::with_capacity(para_pr.len() + 32);
     let mut rest = para_pr;
     let mut branches = 0usize;
@@ -304,9 +310,21 @@ fn set_margin_indent(para_pr: &str, left: i64, intent: i64) -> Result<String> {
         };
         out.push_str(&rest[..at]);
         let (b1, h1) = set_attr(body, "<hc:left", "value", &(left * scale).to_string(), false);
-        let (b2, h2) = set_attr(&b1, "<hc:intent", "value", &(intent * scale).to_string(), false);
+        let (mut b2, h2) = set_attr(&b1, "<hc:intent", "value", &(intent * scale).to_string(), false);
         if h1 == 0 || h2 == 0 {
             bail!("`hh:margin` 에 `hc:left`·`hc:intent` 가 없습니다 (left {h1}건, intent {h2}건)");
+        }
+        // 간격도 **같은 배수 규칙**을 탄다 — 실측에서 `prev` 도
+        // `default = case × 2` 였다(130건).
+        if let Some((before, after)) = space {
+            let (n1, p1) = set_attr(&b2, "<hc:prev", "value", &(before * scale).to_string(), false);
+            let (n2, p2) = set_attr(&n1, "<hc:next", "value", &(after * scale).to_string(), false);
+            if p1 == 0 || p2 == 0 {
+                bail!(
+                    "`hh:margin` 에 `hc:prev`·`hc:next` 가 없습니다 (prev {p1}건, next {p2}건)"
+                );
+            }
+            b2 = n2;
         }
         out.push_str(&b2);
         rest = &rest[end..];
@@ -323,6 +341,26 @@ fn set_margin_indent(para_pr: &str, left: i64, intent: i64) -> Result<String> {
     Ok(out)
 }
 
+/// 베낀 `paraPr` 의 `hp:case` 쪽 `left`·`intent` 를 읽는다.
+///
+/// 간격만 바꾸려는 요청에서 들여쓰기를 0 으로 덮지 않으려고 있다 — 말하지
+/// 않은 것을 바꾸는 것이 이 저장소가 가장 경계하는 꼴이다.
+fn read_margin(para_pr: &str) -> (i64, i64) {
+    let Some(at) = para_pr.find("<hp:case") else { return (0, 0) };
+    let Some(end) = para_pr[at..].find("</hp:case>").map(|k| at + k) else { return (0, 0) };
+    let seg = &para_pr[at..end];
+    let num = |tag: &str| -> i64 {
+        seg.find(tag)
+            .and_then(|k| {
+                let k = k + tag.len();
+                seg[k..].find("value=\"").map(|v| k + v + "value=\"".len())
+            })
+            .and_then(|k| seg[k..].find('"').and_then(|e| seg[k..k + e].parse().ok()))
+            .unwrap_or(0)
+    };
+    (num("<hc:left"), num("<hc:intent"))
+}
+
 /// 문단 서식을 고친다 — 정렬과 들여쓰기. **`paraPr` 을 한 번만 베낀다.**
 ///
 /// 정렬과 들여쓰기를 따로 부르면 `paraPr` 이 두 벌 복제되고, 그래도 결과는
@@ -334,6 +372,8 @@ pub fn set_para_style(
     horizontal: Option<&str>,
     // `(first_indent, rest_indent)` — HWPUNIT, 증인이 읽는 그 단위.
     indent: Option<(i64, i64)>,
+    // `(위 간격, 아래 간격)` — HWPUNIT. 1 pt = 100.
+    space: Option<(i64, i64)>,
 ) -> Result<()> {
     let sec_name = format!("Contents/section{section}.xml");
     let Some(sec) = pkg.text(&sec_name) else {
@@ -424,7 +464,10 @@ pub fn set_para_style(
         }
         fresh = next;
     }
-    if let Some((first, rest_i)) = indent {
+    // 들여쓰기와 간격은 같은 `hh:margin` 안에 있으므로 한 번에 적는다 —
+    // 두 번 훑으면 두 번째가 첫 번째의 결과 위에서 자리를 다시 찾아야 한다.
+    if indent.is_some() || space.is_some() {
+        let (first, rest_i) = indent.unwrap_or((0, 0));
         // 증인의 공식을 되돌린다: `first = left + max(intent,0)`,
         // `rest = left + max(-intent,0)` 이므로 `left = min(first, rest)` 이고
         // `intent = first - rest` 다. (s03 paraPr 69 로 확인: left 1330 ·
@@ -432,7 +475,16 @@ pub fn set_para_style(
         if first < 0 || rest_i < 0 {
             bail!("들여쓰기는 음수일 수 없습니다 (first {first}, rest {rest_i}) — 내어쓰기는 `firstIndent < restIndent` 로 적습니다");
         }
-        fresh = set_margin_indent(&fresh, first.min(rest_i), first - rest_i)?;
+        // 들여쓰기를 안 줬으면 **지금 값을 그대로** 둔다 — 0 으로 덮으면
+        // 간격만 바꾸려다 들여쓰기를 날린다.
+        let (l, i) = match indent {
+            Some(_) => (first.min(rest_i), first - rest_i),
+            None => {
+                let cur = read_margin(&fresh);
+                (cur.0, cur.1)
+            }
+        };
+        fresh = set_margin_indent(&fresh, l, i, space)?;
     }
     let (f2, idh) = set_attr(&fresh, "<hh:paraPr", "id", &new_id.to_string(), false);
     if idh == 0 {
@@ -1133,11 +1185,13 @@ mod indent_tests {
         r#"<hp:switch>"#,
         r#"<hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar">"#,
         r#"<hh:margin><hc:intent value="0" unit="HWPUNIT"/><hc:left value="0" unit="HWPUNIT"/>"#,
-        r#"<hc:right value="0" unit="HWPUNIT"/></hh:margin>"#,
+        r#"<hc:right value="0" unit="HWPUNIT"/><hc:prev value="0" unit="HWPUNIT"/>"#,
+        r#"<hc:next value="0" unit="HWPUNIT"/></hh:margin>"#,
         r#"<hh:lineSpacing type="PERCENT" value="160" unit="HWPUNIT"/></hp:case>"#,
         r#"<hp:default>"#,
         r#"<hh:margin><hc:intent value="0" unit="HWPUNIT"/><hc:left value="0" unit="HWPUNIT"/>"#,
-        r#"<hc:right value="0" unit="HWPUNIT"/></hh:margin>"#,
+        r#"<hc:right value="0" unit="HWPUNIT"/><hc:prev value="0" unit="HWPUNIT"/>"#,
+        r#"<hc:next value="0" unit="HWPUNIT"/></hh:margin>"#,
         r#"<hh:lineSpacing type="PERCENT" value="160" unit="HWPUNIT"/></hp:default>"#,
         r#"</hp:switch></hh:paraPr>"#,
     );
@@ -1145,7 +1199,7 @@ mod indent_tests {
     #[test]
     fn 들여쓰기는_두_묶음에_1배와_2배로_적힌다() {
         // 내어쓰기: 첫 줄 0, 나머지 2835 → left = 0, intent = -2835
-        let out = set_margin_indent(SWITCHED, 0, -2835).expect("적기");
+        let out = set_margin_indent(SWITCHED, 0, -2835, None).expect("적기");
         let branches: Vec<&str> = out
             .split("<hp:")
             .filter(|b| b.starts_with("case") || b.starts_with("default"))
@@ -1165,6 +1219,35 @@ mod indent_tests {
         assert_eq!(out.matches(r#"value="160""#).count(), 2, "줄 간격을 건드렸다\n{out}");
     }
 
+    /// **문단 간격도 같은 배수 규칙을 탄다.**
+    ///
+    /// 되읽기로는 못 잡는다 — 우리 증인도 `rhwp` 도 `hp:case` 만 읽는다.
+    /// 실측으로 확인했다: `hp:default` 에 1배로 적고 `.hwp` 로 변환해 양쪽을
+    /// 읽어 봤는데 **결과가 같았다**(10.0pt / 10.0pt). 그래서 여기서 센다.
+    #[test]
+    fn 문단_간격도_두_묶음에_1배와_2배로_적힌다() {
+        // 위 10pt · 아래 3pt
+        let out = set_margin_indent(SWITCHED, 0, 0, Some((1_000, 300))).expect("적기");
+        let branches: Vec<&str> = out
+            .split("<hp:")
+            .filter(|b| b.starts_with("case") || b.starts_with("default"))
+            .collect();
+        assert_eq!(branches.len(), 2, "묶음이 둘이어야 한다\n{out}");
+        assert!(
+            branches[0].contains(r#"<hc:prev value="1000""#)
+                && branches[0].contains(r#"<hc:next value="300""#),
+            "hp:case 는 1배여야 한다\n{}", branches[0]
+        );
+        assert!(
+            branches[1].contains(r#"<hc:prev value="2000""#)
+                && branches[1].contains(r#"<hc:next value="600""#),
+            "hp:default 는 2배여야 한다 — 같은 수를 쓰면 그쪽을 읽는 도구에서 \
+             간격이 절반이 된다\n{}", branches[1]
+        );
+        // 간격만 달라고 했으면 줄 간격은 건드리지 않는다
+        assert_eq!(out.matches(r#"value="160""#).count(), 2, "줄 간격을 건드렸다\n{out}");
+    }
+
     /// **두 벌이 다 있어야 쓴다.** 한쪽만 고치면 다른 쪽에 옛 값이 남고,
     /// 한글이 어느 쪽을 읽느냐에 따라 결과가 갈린다 — 조용히.
     #[test]
@@ -1172,7 +1255,7 @@ mod indent_tests {
         let one = SWITCHED
             .replace(r#"<hp:default>"#, "<!--")
             .replace("</hp:default>", "-->");
-        let e = set_margin_indent(&one, 0, -100).expect_err("거부해야 한다");
+        let e = set_margin_indent(&one, 0, -100, None).expect_err("거부해야 한다");
         assert!(format!("{e}").contains("두 벌"), "{e}");
     }
 
@@ -1184,7 +1267,7 @@ mod indent_tests {
             "http://www.hancom.co.kr/hwpml/2016/HwpUnitChar",
             "http://example.com/other",
         );
-        let e = set_margin_indent(&odd, 0, -100).expect_err("거부해야 한다");
+        let e = set_margin_indent(&odd, 0, -100, None).expect_err("거부해야 한다");
         let m = format!("{e}");
         assert!(m.contains("HwpUnitChar"), "{m}");
         assert!(m.contains("재지 않았"), "{m}");

@@ -263,6 +263,14 @@ pub enum OpSpec {
         first_indent: Option<i64>,
         #[serde(rename = "restIndent", alias = "rest_indent")]
         rest_indent: Option<i64>,
+        /// 문단 **위** 간격 (pt). 제목을 본문에서 떼는 자리다.
+        ///
+        /// 실측(실무 문서 `paraPr` 604개): 위 간격을 쓰는 것이 20%(흔한 값
+        /// 5·10·3pt), 아래 간격이 8%.
+        #[serde(rename = "spaceBeforePt", alias = "space_before_pt")]
+        space_before_pt: Option<f64>,
+        #[serde(rename = "spaceAfterPt", alias = "space_after_pt")]
+        space_after_pt: Option<f64>,
     },
     /// **그림을 넣는다** — 그 단락의 첫 구간 안에 놓는다.
     ///
@@ -1958,7 +1966,7 @@ fn lower(
                 (!said.is_empty()).then(|| format!("{} (단락 전체)", said.join(" · "))),
             )
         }
-        OpSpec::SetParaStyle { section, para, align, first_indent, rest_indent } => {
+        OpSpec::SetParaStyle { section, para, align, first_indent, rest_indent, space_before_pt, space_after_pt } => {
             text_at(*section, *para)?;
             use hwp_core::witness::ParaAlign;
             let a = match align.as_deref().map(|s| s.trim().to_lowercase()) {
@@ -1976,11 +1984,37 @@ fn lower(
                     ),
                 }),
             };
-            if a.is_none() && first_indent.is_none() && rest_indent.is_none() {
+            if a.is_none()
+                && first_indent.is_none()
+                && rest_indent.is_none()
+                && space_before_pt.is_none()
+                && space_after_pt.is_none()
+            {
                 anyhow::bail!(
-                    "바꿀 것을 주라 — `align`·`firstIndent`·`restIndent` 중 하나는 있어야 한다"
+                    "바꿀 것을 주라 — `align`·`firstIndent`·`restIndent`·\
+                     `spaceBeforePt`·`spaceAfterPt` 중 하나는 있어야 한다"
                 );
             }
+            // **간격은 한쪽만 줘도 된다** — 나머지는 지금 값에서 온다.
+            // 들여쓰기와 달리 둘이 서로 환산되지 않고 각자 한 칸이다.
+            let now_style = cur.styles.get(&(*section, *para)).copied();
+            let pt_to_hu = |x: f64| (x * 100.0).round() as i64;
+            let (sb, sa) = if space_before_pt.is_some() || space_after_pt.is_some() {
+                for (k, v) in [("spaceBeforePt", space_before_pt), ("spaceAfterPt", space_after_pt)] {
+                    if let Some(x) = v {
+                        if !(x.is_finite() && *x >= 0.0) {
+                            anyhow::bail!("{k} 가 0 이상의 수가 아니다: {x}");
+                        }
+                    }
+                }
+                let st = now_style.unwrap_or_default();
+                (
+                    Some(space_before_pt.map(pt_to_hu).unwrap_or(st.space_before)),
+                    Some(space_after_pt.map(pt_to_hu).unwrap_or(st.space_after)),
+                )
+            } else {
+                (None, None)
+            };
             for (k, v) in [("firstIndent", first_indent), ("restIndent", rest_indent)] {
                 if let Some(x) = v {
                     if *x < 0 {
@@ -1994,7 +2028,7 @@ fn lower(
             // `left`·`intent` 로 환산되므로(증인 공식의 역) 한쪽만으로는
             // 쓸 수 없다. 모르는 값을 0 으로 메우면 멀쩡해 보이는 채로
             // 반대쪽 들여쓰기를 날린다.
-            let now = cur.styles.get(&(*section, *para)).copied();
+            let now = now_style;
             let (fi, ri) = match (first_indent, rest_indent) {
                 (None, None) => (None, None),
                 (Some(f), Some(r)) => (Some(*f), Some(*r)),
@@ -2026,6 +2060,8 @@ fn lower(
                     align: a,
                     first_indent: fi,
                     rest_indent: ri,
+                    space_before: sb,
+                    space_after: sa,
                 }],
                 said,
             )
@@ -2130,6 +2166,8 @@ fn lower(
                         align: Some(pa),
                         first_indent: None,
                         rest_indent: None,
+                        space_before: None,
+                        space_after: None,
                     });
                     let has_text = !cur
                         .paras
@@ -2665,6 +2703,11 @@ fn styles_json(t: &Testimony) -> Vec<Value> {
                 "section": p.section,
                 "para": i,
                 "align": format!("{:?}", p.style.align).to_lowercase(),
+                // **문단 간격**(pt). 제목이 본문에 붙어 보이는 것이 품질
+                // 불만의 큰 몫이었고, 고치려면 먼저 읽을 수 있어야 한다
+                // (hwp-vi#12 에서 배운 순서다). 1 pt = 100 HWPUNIT.
+                "spaceBeforePt": (p.style.space_before as f64) / 100.0,
+                "spaceAfterPt": (p.style.space_after as f64) / 100.0,
                 // 들여쓰기는 HWPUNIT (1pt = 100)
                 "firstIndent": p.style.first_indent,
                 "restIndent": p.style.rest_indent,
@@ -3163,7 +3206,7 @@ mod tests {
         let local: Vec<(&str, bool)> = vec![
             (
                 "set-para-style",
-                Op::SetParaStyle { at: (0, 0), align: Some(ParaAlign::Center), first_indent: None, rest_indent: None }.local(),
+                Op::SetParaStyle { at: (0, 0), align: Some(ParaAlign::Center), first_indent: None, rest_indent: None, space_before: None, space_after: None }.local(),
             ),
             (
                 "set-deco",

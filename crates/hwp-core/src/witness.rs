@@ -307,6 +307,18 @@ pub struct ParaStyle {
     pub first_indent: i64,
     /// 이어지는 줄이 들어가는 양 (HWPUNIT). `left + max(-intent, 0)` — 내어쓰기.
     pub rest_indent: i64,
+    /// 문단 **위** 간격 (HWPUNIT). `1 pt = 100`.
+    ///
+    /// 전에는 버렸다 — 터미널에 빈 줄로 그리면 조판기가 준 쪽·줄 수와
+    /// 어긋나기 때문이다. 그건 **그리기**의 사정이고, 읽는 것은 다른 일이다.
+    /// 쓰려면 읽을 수 있어야 한다(hwp-vi#12 에서 배운 순서다) — 제목이 본문에
+    /// 붙어 보이는 것이 품질 불만의 큰 몫이었고, 그걸 고치려면 이 칸이 먼저다.
+    ///
+    /// 실측(실무 문서 `paraPr` 604개): 위 간격을 쓰는 것이 **20%**(흔한 값
+    /// 500·1000·300 = 5·10·3pt), 아래 간격이 **8%**(200·300·700).
+    pub space_before: i64,
+    /// 문단 **아래** 간격 (HWPUNIT).
+    pub space_after: i64,
 }
 
 /// 문단 정렬. 터미널은 양쪽맞춤을 할 수 없어 `Justify`·`Distribute`·`Division`
@@ -1221,11 +1233,22 @@ fn para_shapes(doc_info: &[u8]) -> Vec<ParaStyle> {
         let attr = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
         let left = i32_at(4);
         let intent = i32_at(12);
+        // `[16..20]` 위 간격 · `[20..24]` 아래 간격. 레이아웃 셈이 맞아떨어진다:
+        // attr(4) + left(4) + right(4) + intent(4) = 16 다음 자리다. 단위는
+        // `left`·`intent` 와 같은 ½ HWPUNIT 으로 보고, **두 포맷 대조로
+        // 확인한다**(`the_two_formats_agree_on_paragraph_spacing`).
+        let (prev, next) = if payload.len() >= 24 {
+            (i32_at(16), i32_at(20))
+        } else {
+            (0, 0)
+        };
         out.push(ParaStyle {
             align: ParaAlign::from_bits(attr),
             // 저장 단위가 HWPUNIT 의 절반이다 (위 문서 주석의 실측)
             first_indent: (left + intent.max(0)) / 2,
             rest_indent: (left + (-intent).max(0)) / 2,
+            space_before: prev / 2,
+            space_after: next / 2,
         });
     }
     out
@@ -1693,10 +1716,12 @@ fn para_styles_from_header(xml: &str) -> HashMap<String, ParaStyle> {
     // 지금 읽고 있는 paraPr 의 id, 그리고 HWPUNIT case 안인지
     let mut open: Option<String> = None;
     let mut in_hwpunit = false;
-    let mut margin: Option<(i64, i64)> = None; // (left, intent)
+    let mut margin: Option<(i64, i64, i64, i64)> = None; // (left, intent, prev, next)
     let mut align = ParaAlign::default();
     let mut left = 0i64;
     let mut intent = 0i64;
+    let mut prev = 0i64;
+    let mut next = 0i64;
 
     loop {
         let ev = match reader.read_event() {
@@ -1715,6 +1740,8 @@ fn para_styles_from_header(xml: &str) -> HashMap<String, ParaStyle> {
                         align = ParaAlign::default();
                         left = 0;
                         intent = 0;
+                        prev = 0;
+                        next = 0;
                     }
                     "hp:case" => {
                         in_hwpunit = attr(e, "hp:required-namespace")
@@ -1733,6 +1760,12 @@ fn para_styles_from_header(xml: &str) -> HashMap<String, ParaStyle> {
                     "hc:intent" if in_hwpunit => {
                         intent = attr(e, "value").and_then(|v| v.parse().ok()).unwrap_or(0);
                     }
+                    "hc:prev" if in_hwpunit => {
+                        prev = attr(e, "value").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    }
+                    "hc:next" if in_hwpunit => {
+                        next = attr(e, "value").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    }
                     _ => {}
                 }
             }
@@ -1741,19 +1774,21 @@ fn para_styles_from_header(xml: &str) -> HashMap<String, ParaStyle> {
                 match name.as_str() {
                     "hp:case" => {
                         if in_hwpunit {
-                            margin = Some((left, intent));
+                            margin = Some((left, intent, prev, next));
                         }
                         in_hwpunit = false;
                     }
                     "hh:paraPr" => {
                         if let Some(id) = open.take() {
-                            let (l, i) = margin.unwrap_or((0, 0));
+                            let (l, i, pv, nx) = margin.unwrap_or((0, 0, 0, 0));
                             out.insert(
                                 id,
                                 ParaStyle {
                                     align,
                                     first_indent: l + i.max(0),
                                     rest_indent: l + (-i).max(0),
+                                    space_before: pv,
+                                    space_after: nx,
                                 },
                             );
                         }

@@ -4636,7 +4636,7 @@ fn changing_one_paragraphs_alignment_does_not_spread_to_others() {
     let to = if was == ParaAlign::Center { ParaAlign::Right } else { ParaAlign::Center };
 
     let mut log = hwp_core::edit::EditLog::new();
-    log.push(hwp_core::edit::Op::SetParaStyle { at: (0, target), align: Some(to), first_indent: None, rest_indent: None });
+    log.push(hwp_core::edit::Op::SetParaStyle { at: (0, target), align: Some(to), first_indent: None, rest_indent: None, space_before: None, space_after: None });
     hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("정렬 바꾸기: {e:#}"));
 
     let after = aligns(&doc);
@@ -4663,7 +4663,7 @@ fn changing_one_paragraphs_alignment_does_not_spread_to_others() {
     let cfb = dir.join("x.hwp");
     std::fs::copy(&out, &cfb).expect("복사");
     let mut log2 = hwp_core::edit::EditLog::new();
-    log2.push(hwp_core::edit::Op::SetParaStyle { at: (0, target), align: Some(to), first_indent: None, rest_indent: None });
+    log2.push(hwp_core::edit::Op::SetParaStyle { at: (0, target), align: Some(to), first_indent: None, rest_indent: None, space_before: None, space_after: None });
     let e = hwp_core::edit::save(&rhwp, &cfb, &log2).expect_err("`.hwp` 는 거부해야 한다");
     let msg = format!("{e:#}");
     assert!(
@@ -5297,7 +5297,7 @@ fn an_indent_we_write_reads_back_the_same_in_both_formats() {
         at,
         align: None,
         first_indent: Some(0),
-        rest_indent: Some(REST),
+        rest_indent: Some(REST), space_before: None, space_after: None,
     });
     hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("들여쓰기: {e:#}"));
 
@@ -5456,6 +5456,8 @@ fn editing_one_paragraphs_style_clones_the_shared_para_pr() {
         align: None,
         first_indent: Some(0),
         rest_indent: Some(want_rest),
+        space_before: None,
+        space_after: None,
     });
     hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("서식 고치기: {e:#}"));
 
@@ -6158,6 +6160,159 @@ fn create_reports_where_each_block_landed() {
         "같은 글자인 두 블록이 **같은 좌표**로 보고됐다 — 집합으로 맞춘 것이다. \
          앞에서부터 훑으면 순서대로 갈린다."
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **두 포맷이 문단 간격에 같은 말을 하는가** — 쓰기의 전제.
+///
+/// 간격은 전에 버려 뒀다 — 터미널에 빈 줄로 그리면 조판기가 준 쪽·줄 수와
+/// 어긋나기 때문이다. 그건 **그리기**의 사정이고 읽는 것은 다른 일이다.
+/// 제목이 본문에 붙어 보이는 것이 품질 불만의 큰 몫이었고, 고치려면 먼저
+/// 읽을 수 있어야 한다(hwp-vi#12 에서 배운 순서다).
+///
+/// HWP5 는 `PARA_SHAPE[16..20]`(위)·`[20..24]`(아래)를 **½ HWPUNIT** 으로 들고,
+/// HWPX 는 `hh:margin` 의 `hc:prev`·`hc:next` 를 `hp:switch` 두 벌로 든다.
+/// 자리를 짐작하지 않고 **변환해서 견준다** — 한쪽만 맞으면 변환을 거친
+/// 문서에서 틀린다.
+#[test]
+fn the_two_formats_agree_on_paragraph_spacing() {
+    let Some((rhwp, _)) = backend() else { return };
+    let hwpx: Vec<PathBuf> = samples()
+        .into_iter()
+        .filter(|f| f.extension().and_then(|s| s.to_str()) == Some("hwpx"))
+        .collect();
+    assert!(!hwpx.is_empty(), "HWPX 표본이 없다");
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-sp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+
+    let spacing = |p: &std::path::Path| -> std::collections::BTreeMap<(u32, u32), (i64, i64)> {
+        Testimony::read(p)
+            .expect("증인")
+            .body_paragraphs()
+            .into_iter()
+            .filter_map(|x| {
+                let i = x.index?;
+                Some(((x.section, i), (x.style.space_before, x.style.space_after)))
+            })
+            .collect()
+    };
+
+    let mut checked = 0usize;
+    let mut with_spacing = 0usize;
+    let mut problems: Vec<String> = Vec::new();
+    for (n, x) in hwpx.iter().enumerate() {
+        let back = dir.join(format!("s{n}.hwp"));
+        if rhwp
+            .run(&["convert", &x.to_string_lossy(), &back.to_string_lossy()])
+            .is_err()
+        {
+            continue;
+        }
+        let a = spacing(x);
+        let b = spacing(&back);
+        for (c, va) in &a {
+            let Some(vb) = b.get(c) else { continue };
+            checked += 1;
+            if va.0 != 0 || va.1 != 0 {
+                with_spacing += 1;
+            }
+            if va != vb {
+                problems.push(format!(
+                    "{} 구역{} 단락{}: HWPX {va:?} / HWP5 {vb:?}",
+                    x.file_name().unwrap_or_default().to_string_lossy(),
+                    c.0, c.1
+                ));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    assert!(checked > 0, "견준 단락이 없다");
+    // **간격이 0 아닌 단락이 있어야** 자리를 잘못 읽는 것을 볼 수 있다.
+    // 전부 0 이면 엉뚱한 바이트를 읽어도 0 이 나와 통과한다.
+    assert!(
+        with_spacing > 0,
+        "간격이 0 아닌 단락이 코퍼스에 없다 — 자리를 잘못 읽어도 통과한다"
+    );
+}
+
+/// **문단 간격을 쓰고 되읽는다, 그리고 그 단락만 바뀐다** — 품질 불만의 큰 몫.
+///
+/// 실측(실무 문서 `paraPr` 604개): 위 간격을 쓰는 것이 20%(흔한 값
+/// 500·1000·300 = 5·10·3pt), 아래 간격이 8%. 그런데 우리 생성물은 전부 0 이라
+/// 제목이 본문에 붙어 있었다.
+///
+/// `hp:switch` 두 벌에 1배·2배로 적는 것은 들여쓰기와 같은 셈이다.
+#[test]
+fn paragraph_spacing_is_written_and_read_back() {
+    let Some((rhwp, _)) = backend() else { return };
+    let Some(src) = samples()
+        .into_iter()
+        .find(|f| f.extension().and_then(|s| s.to_str()) == Some("hwpx"))
+    else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-spw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+    let doc = dir.join(src.file_name().expect("이름"));
+    std::fs::copy(&src, &doc).expect("문서");
+
+    let styles = |p: &std::path::Path| -> std::collections::BTreeMap<(u32, u32), hwp_core::witness::ParaStyle> {
+        let t = Testimony::read(p).expect("증인");
+        hwp_core::edit::snapshot(&t, p).styles
+    };
+    let before = styles(&doc);
+    let Some((&at, was)) = before.iter().find(|(c, _)| before.contains_key(c)) else {
+        panic!("본문 단락이 없다");
+    };
+    let was = *was;
+    const B: i64 = 1_000; // 10pt
+    const A: i64 = 300; //  3pt
+    assert!(
+        (was.space_before, was.space_after) != (B, A),
+        "바꾸기 전과 같은 값을 쓰면 바뀜이 안 보인다"
+    );
+
+    let mut log = hwp_core::edit::EditLog::new();
+    log.push(hwp_core::edit::Op::SetParaStyle {
+        at,
+        align: None,
+        first_indent: None,
+        rest_indent: None,
+        space_before: Some(B),
+        space_after: Some(A),
+    });
+    hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("간격 쓰기: {e:#}"));
+
+    let after = styles(&doc);
+    let got = after.get(&at).copied().expect("그 단락");
+    assert_eq!(got.space_before, B, "위 간격이 다르다");
+    assert_eq!(got.space_after, A, "아래 간격이 다르다");
+    // **들여쓰기를 날리지 않았는가** — 간격만 달라고 했다
+    assert_eq!(
+        (got.first_indent, got.rest_indent),
+        (was.first_indent, was.rest_indent),
+        "말하지 않은 들여쓰기가 바뀌었다"
+    );
+    assert_eq!(got.align, was.align, "말하지 않은 정렬이 바뀌었다");
+
+    // **다른 단락은 그대로** — `paraPr` 은 심하게 공유된다
+    for (c, b) in &before {
+        if *c == at {
+            continue;
+        }
+        assert_eq!(
+            after.get(c).copied().map(|s| (s.space_before, s.space_after)),
+            Some((b.space_before, b.space_after)),
+            "구역{} 단락{} 의 간격이 함께 바뀌었다",
+            c.0, c.1
+        );
+    }
+
+    rhwp.run(&["convert", &doc.to_string_lossy(), &dir.join("b.hwp").to_string_lossy(), "--verify"])
+        .unwrap_or_else(|e| panic!("백엔드가 우리가 쓴 간격을 거부했다: {e:#}"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
