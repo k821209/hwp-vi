@@ -245,8 +245,8 @@ impl TextFile {
                 Op::SetDeco { .. } => {
                     bail!("{step}번째 연산: 텍스트 파일에는 글자 꾸밈이 없습니다 — {}", op.describe());
                 }
-                Op::SetCharSize { .. } => {
-                    bail!("{step}번째 연산: 텍스트 파일에는 글자 크기가 없습니다 — {}", op.describe());
+                Op::SetChar { .. } => {
+                    bail!("{step}번째 연산: 텍스트 파일에는 글자 서식이 없습니다 — {}", op.describe());
                 }
                 Op::InsertImage { .. } => {
                     bail!("{step}번째 연산: 텍스트 파일에는 그림을 넣을 수 없습니다 — {}", op.describe());

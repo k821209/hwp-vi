@@ -5531,7 +5531,7 @@ fn changing_one_paragraphs_char_size_does_not_spread_to_others() {
     let want = if was == 2_000 { 1_100 } else { 2_000 };
 
     let mut log = hwp_core::edit::EditLog::new();
-    log.push(hwp_core::edit::Op::SetCharSize { at: target, size_100pt: want });
+    log.push(hwp_core::edit::Op::SetChar { at: target, size_100pt: Some(want), font: None });
     hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("크기 바꾸기: {e:#}"));
 
     let after = sizes(&doc);
@@ -5784,6 +5784,177 @@ fn an_images_requested_alignment_round_trips_including_left() {
         vec!["left".to_string()],
         "`align` 을 안 줬는데 왼쪽이 걸렸다 — 준 것과 안 준 것이 같아졌다"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **두 포맷이 구간의 글꼴 이름에 같은 말을 하는가** — hwp-vi#12 의 전제.
+///
+/// 글꼴 쓰기가 거부돼 있던 이유는 증인이 글꼴을 읽지 않아서였다. 사용자가
+/// "증인이 글꼴을 읽게 하는 쪽" 을 제안했고 그게 맞았다 — 되읽을 수 있게 되면
+/// 같은 근거로 쓸 수 있다.
+///
+/// 읽는 길이 포맷마다 다르다. HWP5 는 `CHAR_SHAPE` 앞 14바이트(7개 언어의
+/// `u16` 번호) + `ID_MAPPINGS[1..8]` 로 언어별 블록 경계 + `FACE_NAME` 의
+/// UTF-16 이름. HWPX 는 `charPr/@fontRef[lang]` + `hh:fontfaces`. **둘이 같은
+/// 답을 내는지**가 이 시험이다 — 한쪽만 맞으면 변환을 거친 문서에서 틀린다.
+#[test]
+fn the_two_formats_agree_on_run_font_names() {
+    let Some((rhwp, _)) = backend() else { return };
+    // **짝을 시험이 만든다.** 코퍼스에 같은 문서의 두 포맷이 있기를 기대했다가
+    // 조용히 건너뛰고 통과한 적이 있다(사보타주로 찾았다) — 비공개 코퍼스에는
+    // 짝이 하나도 없었다. 변환해서 만들면 코퍼스에 의존하지 않고, 묻는 질문도
+    // 더 정확하다: "변환을 거친 같은 문서를 두 판독기가 같게 읽는가".
+    let hwpx: Vec<PathBuf> = samples()
+        .into_iter()
+        .filter(|f| f.extension().and_then(|s| s.to_str()) == Some("hwpx"))
+        .collect();
+    assert!(!hwpx.is_empty(), "HWPX 표본이 없다");
+
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-ff-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+
+    let fonts = |p: &std::path::Path| -> std::collections::BTreeMap<(u32, u32), Vec<(String, String, u32)>> {
+        Testimony::read(p)
+            .expect("증인")
+            .body_paragraphs()
+            .into_iter()
+            .filter_map(|para| {
+                let i = para.index?;
+                Some((
+                    (para.section, i),
+                    para.runs
+                        .iter()
+                        .map(|r| (r.font.clone(), r.font_latin.clone(), r.size_100pt))
+                        .collect(),
+                ))
+            })
+            .collect()
+    };
+
+    let mut checked = 0usize;
+    let mut mixed = 0usize;
+    let mut problems: Vec<String> = Vec::new();
+    for (n, x) in hwpx.iter().enumerate() {
+        let back = dir.join(format!("p{n}.hwp"));
+        if rhwp
+            .run(&["convert", &x.to_string_lossy(), &back.to_string_lossy()])
+            .is_err()
+        {
+            // 변환이 안 되는 문서는 이 질문의 대상이 아니다
+            continue;
+        }
+        let a = fonts(x);
+        let b = fonts(&back);
+        for (coord, ra) in &a {
+            let Some(rb) = b.get(coord) else { continue };
+            checked += 1;
+            mixed += ra.iter().filter(|(h, l, _)| !h.is_empty() && !l.is_empty() && h != l).count();
+            if ra != rb {
+                problems.push(format!(
+                    "{} 구역{} 단락{}: HWPX {:?} / HWP5 {:?}",
+                    x.file_name().unwrap_or_default().to_string_lossy(),
+                    coord.0, coord.1, ra, rb
+                ));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    assert!(checked > 0, "견준 단락이 없다 — 변환이 하나도 되지 않았다");
+
+    // **한글≠라틴 구간이 하나라도 있어야** 언어 블록을 혼동하는 결함을 볼 수
+    // 있다. 전부 같은 글꼴인 코퍼스에서는 혼동해도 같은 이름이 나온다 —
+    // 실제로 그래서 사보타주가 통과했다. 그때는 못 덮는 것을 말한다.
+    if mixed == 0 {
+        eprintln!(
+            "⚠ 한글≠라틴인 구간이 코퍼스에 없다 — 언어 블록 혼동은 \
+             `witness::face_name_tests` 가 본다 (여기서는 못 본다)"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **글꼴을 쓰고 되읽는다, 그리고 그 단락만 바뀐다** — hwp-vi#12.
+///
+/// 막힌 일이 구체적이었다: "본문은 함초롬바탕, 명령·코드는 고정폭이어야 한다.
+/// 비례 글꼴로 조판하면 들여쓰기와 `|` 위치가 어긋나 읽기 어렵다."
+///
+/// **일곱 언어를 다 맞춘다.** 실측(실무 문서 구간 752개): 233개(31%)가
+/// 한글≠라틴이다. 한쪽만 건드리면 반쪽만 바뀐 상태가 흔하게 남고, 그 꼴이
+/// 바로 코드가 섞여 보이는 것이다. 그래서 한글·라틴 **둘 다** 본다.
+#[test]
+fn setting_a_paragraphs_font_is_verified_by_reading_it_back() {
+    let Some((rhwp, _)) = backend() else { return };
+    let Some(src) = samples()
+        .into_iter()
+        .find(|f| f.extension().and_then(|s| s.to_str()) == Some("hwpx"))
+    else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-font-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+    let doc = dir.join(src.file_name().expect("이름"));
+    std::fs::copy(&src, &doc).expect("문서");
+
+    let marks = |p: &std::path::Path| -> std::collections::BTreeMap<(u32, u32), Vec<(String, String)>> {
+        let t = Testimony::read(p).expect("증인");
+        hwp_core::edit::snapshot(&t, p).fonts
+    };
+    let before = marks(&doc);
+    // 글자가 있고, 지금 글꼴이 D2Coding 이 아닌 단락
+    const FACE: &str = "D2Coding";
+    let Some((&at, _)) = before
+        .iter()
+        .find(|(_, v)| !v.is_empty() && v.iter().all(|(h, _)| h != FACE))
+    else {
+        panic!("글자가 있는 본문 단락이 없다");
+    };
+
+    let mut log = hwp_core::edit::EditLog::new();
+    log.push(hwp_core::edit::Op::SetChar {
+        at,
+        size_100pt: None,
+        font: Some(FACE.to_string()),
+    });
+    hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("글꼴 바꾸기: {e:#}"));
+
+    let after = marks(&doc);
+    let got = after.get(&at).expect("그 단락");
+    assert!(
+        got.iter().all(|(h, l)| h == FACE && l == FACE),
+        "한글·라틴 둘 다 {FACE} 여야 한다 — 한쪽만 바뀌면 코드가 섞여 보인다: {got:?}"
+    );
+    assert_eq!(got.len(), before[&at].len(), "글자 수가 달라졌다");
+
+    // **다른 단락은 그대로** — `charPr` 은 심하게 공유된다
+    for (c, b) in &before {
+        if *c == at {
+            continue;
+        }
+        assert_eq!(
+            after.get(c),
+            Some(b),
+            "구역{} 단락{} 의 글꼴이 함께 바뀌었다 — `charPr` 을 제자리에서 고친 듯하다",
+            c.0, c.1
+        );
+    }
+
+    // **백엔드가 받는가** — `hh:fontfaces` 에 항목을 새로 더했으므로 본 시험이다
+    let back = dir.join("back.hwp");
+    rhwp.run(&["convert", &doc.to_string_lossy(), &back.to_string_lossy(), "--verify"])
+        .unwrap_or_else(|e| panic!("백엔드가 우리가 더한 글꼴을 거부했다: {e:#}"));
+    // 변환본에서도 그 글꼴로 읽혀야 한다
+    let t5 = Testimony::read(&back).expect("증인");
+    let hit = t5
+        .body_paragraphs()
+        .into_iter()
+        .filter(|p| (p.section, p.index.unwrap_or(u32::MAX)) == at)
+        .flat_map(|p| p.runs.clone())
+        .all(|r| r.font == FACE && r.font_latin == FACE);
+    assert!(hit, "변환본에서 글꼴이 {FACE} 가 아니다");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

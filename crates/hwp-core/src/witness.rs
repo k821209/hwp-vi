@@ -217,7 +217,7 @@ fn tidy_runs(mut runs: Vec<Run>, text: &str) -> Vec<Run> {
 /// 차지한다. 실측으로 확정했다: s00.hwp 의 한 단락이 보이는 글자 13개인데
 /// 구간 위치가 **20** 이다 — 보이는 글자 기준으로는 나올 수 없는 수다.
 /// 읽을 때 보이는 글자 기준으로 옮겨 둔다. 화면·커서가 그 기준이기 때문이다.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
     pub start: usize,
     pub len: usize,
@@ -229,14 +229,33 @@ pub struct Run {
     /// HWP5 `CHAR_SHAPE` 의 `[42..46]`(INT32) 가 변환된 HWPX 의
     /// `hh:charPr/@height` 와 306개 전부 순서까지 같다.
     pub size_100pt: u32,
+    /// 한글 글꼴 이름. 모르면 빈 글자.
+    ///
+    /// 읽을 수 있어야 쓸 수 있다 — `set-char` 가 글꼴을 거부하고 있던 이유가
+    /// 이 칸이 없었기 때문이다(사용자 보고 hwp-vi#12).
+    pub font: String,
+    /// 라틴(영문) 글꼴 이름 — **코드 블록이 이 둘로 갈린다.**
+    pub font_latin: String,
 }
 
 /// 글자서식 표의 한 항목 — 꾸밈과 크기.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CharShape {
     pub deco: Deco,
     /// 1/100 pt
     pub size_100pt: u32,
+    /// 한글 글꼴 이름. 모르면 빈 글자.
+    pub font: String,
+    /// 라틴(영문) 글꼴 이름. 모르면 빈 글자.
+    ///
+    /// 한글과 따로 드는 이유: **코드 블록이 바로 이 둘이 갈리는 자리다**
+    /// (사용자 보고 hwp-vi#12 — 본문은 함초롬바탕, 명령·코드는 고정폭).
+    /// 한쪽만 읽으면 "글꼴을 바꿨다" 를 되읽어 대조할 때 반쪽만 본다.
+    ///
+    /// 실물은 **일곱 언어**를 따로 들고 있다(한글·라틴·한자·일어·기타·기호·
+    /// 사용자). 일곱을 다 내면 받는 쪽이 매번 일곱을 견줘야 하고, 하나만
+    /// 내면 코드 블록을 못 본다. 그래서 둘이다 — 그 둘이 실무에서 갈린다.
+    pub font_latin: String,
 }
 
 /// 쪽 설정 — 용지와 여백. 단위는 **HWPUNIT**(1/7200 inch).
@@ -961,10 +980,150 @@ const HWPTAG_BEGIN: u32 = 0x10;
 const HWPTAG_PARA_HEADER: u32 = HWPTAG_BEGIN + 50;
 const HWPTAG_PARA_SHAPE: u32 = HWPTAG_BEGIN + 9;
 const HWPTAG_CHAR_SHAPE: u32 = HWPTAG_BEGIN + 5;
+const HWPTAG_ID_MAPPINGS: u32 = HWPTAG_BEGIN + 1;
+const HWPTAG_FACE_NAME: u32 = HWPTAG_BEGIN + 3;
+
+/// `DocInfo` 의 글꼴 이름 표 — **언어마다 따로** 쌓여 있다.
+///
+/// `CHAR_SHAPE` 앞 14바이트가 7개 언어의 글꼴 번호(`u16`)인데, 그 번호는
+/// **그 언어 블록 안에서의 순번**이다. 블록이 몇 개씩인지는 `ID_MAPPINGS` 가
+/// 말한다 — `INT32` 배열이고 `[0]` 이 BinData, `[1..8]` 이 7개 언어의 글꼴 수다.
+///
+/// `FACE_NAME` payload: `[0]` 속성 바이트, `[1..3]` 이름 길이(WCHAR 수),
+/// 그 뒤 UTF-16LE 이름. 속성 바이트의 비트에 따라 뒤에 대체 글꼴 등이 더
+/// 붙지만 이름만 쓰므로 읽지 않는다.
+///
+/// 돌려주는 것은 언어마다의 이름 목록이다. `ID_MAPPINGS` 를 못 읽으면 전부를
+/// 한 블록으로 본다 — 틀린 이름을 주는 것보다 한글 쪽만 맞는 편이 낫고,
+/// 실무 문서는 한글 블록이 맨 앞이다.
+fn face_names(doc_info: &[u8]) -> Vec<Vec<String>> {
+    let recs = collect_records(doc_info);
+    let counts: Vec<usize> = recs
+        .iter()
+        .find(|(tag, _, _)| *tag == HWPTAG_ID_MAPPINGS)
+        .map(|(_, _, pl)| {
+            pl.chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]).max(0) as usize)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let names: Vec<String> = recs
+        .iter()
+        .filter(|(tag, _, pl)| *tag == HWPTAG_FACE_NAME && pl.len() >= 3)
+        .map(|(_, _, pl)| {
+            let n = u16::from_le_bytes([pl[1], pl[2]]) as usize;
+            let want = 3 + n * 2;
+            if pl.len() < want {
+                return String::new();
+            }
+            let units: Vec<u16> = pl[3..want]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        })
+        .collect();
+
+    // `[1..8]` 이 7개 언어의 글꼴 수다. 없으면 전부 한 블록으로.
+    if counts.len() < 8 {
+        return vec![names];
+    }
+    let mut out: Vec<Vec<String>> = Vec::with_capacity(7);
+    let mut at = 0usize;
+    for lang in 1..8 {
+        let n = counts[lang].min(names.len().saturating_sub(at));
+        out.push(names[at..at + n].to_vec());
+        at += n;
+    }
+    out
+}
+
+#[cfg(test)]
+mod face_name_tests {
+    use super::*;
+
+    /// 레코드 하나를 만든다 — 머리 `u32`(태그·수준·길이) + payload.
+    fn rec(tag: u32, payload: &[u8]) -> Vec<u8> {
+        let h = (tag & 0x3FF) | (0 << 10) | ((payload.len() as u32 & 0xFFF) << 20);
+        let mut v = h.to_le_bytes().to_vec();
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// `FACE_NAME` payload: 속성 바이트 + 이름 길이(`u16`, WCHAR 수) + UTF-16LE.
+    fn face(name: &str) -> Vec<u8> {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let mut p = vec![0u8];
+        p.extend_from_slice(&(units.len() as u16).to_le_bytes());
+        for u in units {
+            p.extend_from_slice(&u.to_le_bytes());
+        }
+        p
+    }
+
+    /// **언어마다 블록이 따로다 — `ID_MAPPINGS` 가 그 경계를 말한다.**
+    ///
+    /// 이 시험은 사보타주로 찾았다. 라틴 번호를 **한글 블록에서** 찾게 만들어도
+    /// 두 포맷 대조 시험이 통과했다 — 짝 문서의 글꼴이 전부 같아서 혼동해도
+    /// 같은 이름이 나왔기 때문이다. 블록 경계 셈은 순수 함수이므로 여기서 직접
+    /// 센다. 실무 문서 구간의 31%가 한글≠라틴이라(실측) 이 셈이 틀리면 그
+    /// 31%에서 조용히 틀린 이름이 나온다.
+    #[test]
+    fn 글꼴_이름은_언어_블록마다_따로_센다() {
+        // ID_MAPPINGS: [0] BinData=0, [1] HANGUL=2, [2] LATIN=2, 나머지 0
+        let mut maps: Vec<u8> = Vec::new();
+        for v in [0i32, 2, 2, 0, 0, 0, 0, 0, 0, 0] {
+            maps.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut doc: Vec<u8> = rec(HWPTAG_ID_MAPPINGS, &maps);
+        for n in ["함초롬바탕", "맑은 고딕", "Times New Roman", "D2Coding"] {
+            doc.extend_from_slice(&rec(HWPTAG_FACE_NAME, &face(n)));
+        }
+        let table = face_names(&doc);
+
+        assert_eq!(table.len(), 7, "언어 7개로 갈려야 한다: {table:?}");
+        assert_eq!(table[0], vec!["함초롬바탕", "맑은 고딕"], "한글 블록");
+        assert_eq!(table[1], vec!["Times New Roman", "D2Coding"], "라틴 블록");
+
+        // **같은 번호가 언어마다 다른 글꼴이다** — 이것이 혼동하면 안 되는 이유
+        assert_eq!(face_at(&table, 0, 1), "맑은 고딕");
+        assert_eq!(face_at(&table, 1, 1), "D2Coding");
+        // 없는 자리는 빈 글자 — 지어내지 않는다
+        assert_eq!(face_at(&table, 0, 9), "");
+        assert_eq!(face_at(&table, 5, 0), "");
+    }
+
+    /// `ID_MAPPINGS` 가 없으면 **전부 한 블록**으로 본다 — 틀린 이름을 주는
+    /// 것보다 한글 쪽만 맞는 편이 낫고, 실무 문서는 한글 블록이 맨 앞이다.
+    #[test]
+    fn 경계를_모르면_한_블록으로_본다() {
+        let mut doc: Vec<u8> = Vec::new();
+        for n in ["굴림", "굴림체"] {
+            doc.extend_from_slice(&rec(HWPTAG_FACE_NAME, &face(n)));
+        }
+        let table = face_names(&doc);
+        assert_eq!(table.len(), 1, "{table:?}");
+        assert_eq!(table[0], vec!["굴림", "굴림체"]);
+        assert_eq!(face_at(&table, 0, 1), "굴림체");
+        // 라틴을 물으면 빈 글자다 — 한글 이름을 라틴이라고 하지 않는다
+        assert_eq!(face_at(&table, 1, 0), "");
+    }
+}
+
+/// 그 언어 블록의 `id` 번째 이름. 없으면 빈 글자 — 지어내지 않는다.
+fn face_at(table: &[Vec<String>], lang: usize, id: usize) -> String {
+    table
+        .get(lang)
+        .and_then(|v| v.get(id))
+        .cloned()
+        .unwrap_or_default()
+}
 const HWPTAG_PARA_CHAR_SHAPE: u32 = HWPTAG_BEGIN + 52;
 
 /// `DocInfo` 의 글자서식 표 — `PARA_CHAR_SHAPE` 의 번호가 이 배열을 가리킨다.
 fn char_shapes(doc_info: &[u8]) -> Vec<CharShape> {
+    let faces = face_names(doc_info);
     collect_records(doc_info)
         .into_iter()
         .filter(|(tag, _, payload)| *tag == HWPTAG_CHAR_SHAPE && payload.len() >= 50)
@@ -976,9 +1135,14 @@ fn char_shapes(doc_info: &[u8]) -> Vec<CharShape> {
             // 변환된 HWPX 의 `hh:charPr/@height` 306개와 순서까지 같다.
             let size = i32::from_le_bytes([payload[42], payload[43], payload[44], payload[45]]);
             let attr = u32::from_le_bytes([payload[46], payload[47], payload[48], payload[49]]);
+            // **앞 14바이트가 7개 언어의 글꼴 번호**(`u16`)다 — 위 레이아웃
+            // 셈(`faceNameIds 7×2`)의 그 자리다. `[0]` 한글, `[1]` 라틴.
+            let face_id = |n: usize| u16::from_le_bytes([payload[n * 2], payload[n * 2 + 1]]) as usize;
             CharShape {
                 deco: Deco::from_bits(attr),
                 size_100pt: size.max(0) as u32,
+                font: face_at(&faces, 0, face_id(0)),
+                font_latin: face_at(&faces, 1, face_id(1)),
             }
         })
         .collect()
@@ -1348,7 +1512,7 @@ fn runs_from_char_shape(payload: &[u8], raw_pos: &[usize], shapes: &[CharShape])
         ]) as usize;
         // 원시 위치 → 보이는 글자 번째. 그 자리 이전의 보이는 글자 수다.
         let start = raw_pos.partition_point(|r| *r < pos);
-        let shape = shapes.get(id).copied().unwrap_or_default();
+        let shape = shapes.get(id).cloned().unwrap_or_default();
         marks.push((start.min(visible), shape));
     }
     marks.dedup_by(|a, b| a.1 == b.1);
@@ -1367,6 +1531,8 @@ fn runs_from_char_shape(payload: &[u8], raw_pos: &[usize], shapes: &[CharShape])
             len: end - *start,
             deco: shape.deco,
             size_100pt: shape.size_100pt,
+            font: shape.font.clone(),
+            font_latin: shape.font_latin.clone(),
         });
     }
     out
@@ -1389,6 +1555,47 @@ fn runs_from_char_shape(payload: &[u8], raw_pos: &[usize], shapes: &[CharShape])
 ///
 /// HWP5 와 달리 **여기 값은 이미 HWPUNIT 이다** — 나누지 않는다.
 /// HWPX `header.xml` 의 글자서식 표 — `charPrIDRef` → [`Deco`].
+/// HWPX `header.xml` 의 글꼴 이름 표 — `(언어, 번호)` → 이름.
+///
+/// `hh:fontfaces` → `hh:fontface lang="HANGUL"` → `hh:font id="18" face="…"`.
+/// `charPr/@fontRef` 가 언어마다 그 번호를 가리킨다.
+///
+/// 언어 이름을 열쇠에 넣는 이유: 같은 번호가 언어마다 **다른 글꼴**이다
+/// (실측 s03: HANGUL 23종, 언어 7개). 번호만으로 찾으면 라틴 글꼴에
+/// 한글 이름이 붙는다.
+fn fontfaces_from_header(xml: &str) -> HashMap<(String, String), String> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    let mut out: HashMap<(String, String), String> = HashMap::new();
+    let mut lang = String::new();
+    let attr = |e: &quick_xml::events::BytesStart, name: &str| -> Option<String> {
+        e.attributes()
+            .flatten()
+            .find(|a| a.key.as_ref() == name)
+            .map(|a| a.value.to_string())
+    };
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match e.name().as_ref() {
+                "hh:fontface" => {
+                    lang = attr(&e, "lang").unwrap_or_default();
+                }
+                "hh:font" => {
+                    if let (Some(id), Some(face)) = (attr(&e, "id"), attr(&e, "face")) {
+                        out.insert((lang.clone(), id), face);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    out
+}
+
 fn char_decos_from_header(xml: &str) -> HashMap<String, CharShape> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
@@ -1399,6 +1606,8 @@ fn char_decos_from_header(xml: &str) -> HashMap<String, CharShape> {
     let (mut bold, mut italic) = (false, false);
     let (mut underline, mut strike) = (String::new(), String::new());
     let mut height = 0u32;
+    let (mut font_h, mut font_l) = (String::new(), String::new());
+    let faces = fontfaces_from_header(xml);
 
     let attr = |e: &quick_xml::events::BytesStart, name: &str| -> Option<String> {
         e.attributes()
@@ -1433,6 +1642,12 @@ fn char_decos_from_header(xml: &str) -> HashMap<String, CharShape> {
                 "hh:strikeout" if open.is_some() => {
                     strike = attr(e, "shape").unwrap_or_default();
                 }
+                // **글꼴 참조.** 언어마다 번호가 따로다 — `hangul` 과
+                // `latin` 둘을 쓴다(코드 블록이 그 둘로 갈린다).
+                "hh:fontRef" if open.is_some() => {
+                    font_h = attr(e, "hangul").unwrap_or_default();
+                    font_l = attr(e, "latin").unwrap_or_default();
+                }
                 _ => {}
             },
             Event::End(e) => {
@@ -1443,6 +1658,14 @@ fn char_decos_from_header(xml: &str) -> HashMap<String, CharShape> {
                             CharShape {
                                 deco: Deco::from_owpml(bold, italic, &underline, &strike),
                                 size_100pt: height,
+                                font: faces
+                                    .get(&("HANGUL".to_string(), font_h.clone()))
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                font_latin: faces
+                                    .get(&("LATIN".to_string(), font_l.clone()))
+                                    .cloned()
+                                    .unwrap_or_default(),
                             },
                         );
                     }
@@ -1598,7 +1821,7 @@ fn paras_from_owpml(
                                 .attributes()
                                 .flatten()
                                 .find(|a| a.key.as_ref() == "charPrIDRef")
-                                .and_then(|a| decos.get(&a.value.to_string()).copied())
+                                .and_then(|a| decos.get(&a.value.to_string()).cloned())
                                 .unwrap_or_default();
                             let start = paras[i].text.chars().count();
                             // 길이는 다음 run 이 열릴 때(또는 단락이 닫힐 때)
@@ -1611,6 +1834,8 @@ fn paras_from_owpml(
                                 len: 0,
                                 deco: shape.deco,
                                 size_100pt: shape.size_100pt,
+                                font: shape.font.clone(),
+                                font_latin: shape.font_latin.clone(),
                             });
                         }
                     }

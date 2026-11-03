@@ -931,7 +931,7 @@ impl Buffer {
             // 꾸밈을 거는 키가 없어서 이 연산을 만들지 않는다(`hwp api` 전용).
             // `Back` 에 "그 구간의 옛 꾸밈" 을 더해 두는 것은 쓰이지 않는 셈을
             // 한 벌 더 적는 일이다.
-            Op::SetDeco { .. } | Op::SetParaStyle { .. } | Op::SetCharSize { .. } => return None,
+            Op::SetDeco { .. } | Op::SetParaStyle { .. } | Op::SetChar { .. } => return None,
             // **그림 넣기도 `hwp api` 전용이다.** 화면 편집기에서 그림을 고를
             // 길이 없고, 넣으면 단락의 개체 수가 늘어 화면 모델이 달라진다 —
             // 되돌리기는 `:e!` 로 간다.

@@ -304,17 +304,23 @@ pub enum OpSpec {
         /// `inline: false` 면 떠 있는 그림이므로 `hp:pos/@horzAlign` 에 쓴다.
         align: Option<String>,
     },
-    /// **글자 크기를 바꾼다** — 그 단락 전체.
+    /// **글자 크기와 글꼴을 바꾼다** — 그 단락 전체.
     ///
-    /// 사용자 보고(hwp-vi#5)의 `set-char`. 두 가지를 **받되 거부한다** —
+    /// 사용자 보고 hwp-vi#5(크기) · #12(글꼴).
+    ///
+    /// 글꼴이 처음에 거부됐던 이유는 증인이 구간의 글꼴 이름을 읽지
+    /// 않아서였다. 사용자가 "거부하는 근거에는 동의한다 — 다만 그 때문에
+    /// 문서 안에서 글꼴을 둘로 쓰는 일이 통째로 막혀 있다. **증인이 글꼴을
+    /// 읽게 하는 쪽**을 제안한다" 고 했고, 그게 맞았다. 읽게 만들었으므로
+    /// 이제 쓸 수 있다.
+    ///
+    /// **글꼴은 일곱 언어를 다 맞춘다.** 실측(실무 문서 구간 752개):
+    /// 233개(31%)가 한글≠라틴이다. 한쪽만 건드리면 반쪽만 바뀐 상태가 흔하게
+    /// 남고, 그 꼴이 바로 코드 블록이 섞여 보이는 것이다.
+    ///
+    /// `offset`·`count` 는 **받되 거부한다** — 구간을 쪼개는 일은 따로이고,
     /// serde 가 "모르는 칸" 으로 끝내면 받는 쪽은 왜인지 모르고 오타인 줄
     /// 알고 다시 보낸다(`set-deco` 의 `strike` 와 같은 처리다).
-    ///
-    /// - `font` — 증인이 구간의 글꼴 이름을 **읽지 않는다.** 되읽어 대조할
-    ///   수 없는 것을 쓰면 "걸었다" 고 말하고 아무 일도 하지 않는 연산이 될
-    ///   수 있고, 그걸 아무도 모른다.
-    /// - `offset`·`count` — 구간을 쪼개는 일은 따로다. 조용히 문단 전체를
-    ///   바꾸지 않는다.
     ///
     /// **HWPX 만.** 백엔드의 `apply-char-format` 은 `bold`·`italic`·
     /// `underline` 만 듣는다(실측) — 크기를 줘도 아무 일도 일어나지 않는다.
@@ -1875,36 +1881,56 @@ fn lower(
         }
         OpSpec::SetChar { section, para, size_pt, font, offset, count } => {
             text_at(*section, *para)?;
-            if font.is_some() {
-                anyhow::bail!(
-                    "글꼴 이름은 바꿀 수 없다 — 증인이 구간의 글꼴 이름을 **읽지 않으므로** 되읽어 대조할 수 없다. 확인할 수 없는 것을 쓰면 \"걸었다\" 고 말하고 아무 일도 하지 않는 연산이 되고, 그걸 아무도 모른다. 문서 전체의 글꼴은 `create` 의 `font` 로 정한다."
-                );
-            }
+            // **부분 구간은 받되 거부한다.** 구간을 쪼개는 일은 따로이고,
+            // serde 가 "모르는 칸" 으로 끝내면 받는 쪽은 왜인지 모르고 오타인
+            // 줄 알고 다시 보낸다(`set-deco` 의 `strike` 와 같은 처리다).
             if offset.is_some() || count.is_some() {
                 anyhow::bail!(
-                    "글자 크기는 **단락 단위**로만 바꾼다 — 구간을 쪼개는 일은 아직 없다. `offset`·`count` 를 조용히 무시하고 문단 전체를 바꾸지 않는다. 부분 구간에 걸 수 있는 것은 지금 `set-deco`(진하게·기울임·밑줄)뿐이다."
+                    "글자 서식은 **단락 단위**로만 바꾼다 — 구간을 쪼개는 일은 아직 없다.                      `offset`·`count` 를 조용히 무시하고 문단 전체를 바꾸지 않는다.                      부분 구간에 걸 수 있는 것은 지금 `set-deco`(진하게·기울임·밑줄)뿐이다."
                 );
             }
-            let Some(pt) = size_pt else {
-                anyhow::bail!("`sizePt` 를 주라 — 지금 받는 것은 그것뿐이다");
+            if size_pt.is_none() && font.is_none() {
+                anyhow::bail!("`sizePt` 나 `font` 중 하나는 주라");
+            }
+            let h = match size_pt {
+                None => None,
+                Some(pt) => {
+                    if !(pt.is_finite() && *pt > 0.0) {
+                        anyhow::bail!("`sizePt` 가 양수가 아니다: {pt}");
+                    }
+                    // 1/100 pt — 증인이 `sizePt` 를 그 단위에서 환산해 돌려준다
+                    let v = (pt * 100.0).round() as u32;
+                    if v == 0 {
+                        anyhow::bail!("`sizePt` 가 0.01pt 보다 작다: {pt}");
+                    }
+                    Some(v)
+                }
             };
-            if !(pt.is_finite() && *pt > 0.0) {
-                anyhow::bail!("`sizePt` 가 양수가 아니다: {pt}");
+            let face = match font.as_deref().map(str::trim) {
+                None => None,
+                Some("") => anyhow::bail!("`font` 가 비었다"),
+                Some(f) => Some(f.to_string()),
+            };
+            let mut said: Vec<String> = Vec::new();
+            if let (Some(v), Some(was)) = (
+                h,
+                cur.sizes.get(&(*section, *para)).and_then(|x| x.first().copied()),
+            ) {
+                said.push(format!("{:.1}pt → {:.1}pt", was as f64 / 100.0, v as f64 / 100.0));
             }
-            // 1/100 pt — 증인이 `sizePt` 를 그 단위에서 환산해 돌려준다
-            let h = (pt * 100.0).round() as u32;
-            if h == 0 {
-                anyhow::bail!("`sizePt` 가 0.01pt 보다 작다: {pt}");
+            if let Some(f) = &face {
+                let was = cur.fonts.get(&(*section, *para)).and_then(|x| x.first().cloned());
+                said.push(match was {
+                    Some((hg, lt)) if hg == lt => format!("{hg:?} → {f:?}"),
+                    Some((hg, lt)) => {
+                        format!("(한글 {hg:?}, 라틴 {lt:?}) → {f:?} (일곱 언어 전부)")
+                    }
+                    None => format!("글꼴 {f:?}"),
+                });
             }
-            let now = cur
-                .sizes
-                .get(&(*section, *para))
-                .and_then(|v| v.first().copied());
             (
-                vec![Op::SetCharSize { at: (*section, *para), size_100pt: h }],
-                now.map(|was| {
-                    format!("{:.1}pt → {:.1}pt (단락 전체)", was as f64 / 100.0, pt)
-                }),
+                vec![Op::SetChar { at: (*section, *para), size_100pt: h, font: face }],
+                (!said.is_empty()).then(|| format!("{} (단락 전체)", said.join(" · "))),
             )
         }
         OpSpec::SetParaStyle { section, para, align, first_indent, rest_indent } => {
@@ -2263,6 +2289,74 @@ fn deco_change(sec: u32, para: u32, before: &[String], after: &[String]) -> Valu
     Value::Object(o)
 }
 
+/// 글자 크기가 바뀐 것을 한 줄로. 바뀐 **범위**와 전·후 값을 적는다.
+///
+/// 범위 안에서 값이 여러 가지면 `before`·`after` 를 내지 않는다 — 한 값으로
+/// 말할 수 없는 것을 말하지 않는다(`deco_change` 와 같은 판단이다).
+fn size_change(sec: u32, para: u32, before: &[u32], after: &[u32]) -> Option<Value> {
+    let n = before.len().max(after.len());
+    fn at(v: &[u32], i: usize) -> u32 {
+        v.get(i).copied().unwrap_or(0)
+    }
+    let first = (0..n).find(|&i| at(before, i) != at(after, i))?;
+    let last = (0..n).rev().find(|&i| at(before, i) != at(after, i)).unwrap_or(first);
+    let one = |v: &[u32]| -> Option<f64> {
+        let x = at(v, first);
+        (first..=last).all(|i| at(v, i) == x).then(|| x as f64 / 100.0)
+    };
+    let mut o = Map::new();
+    o.insert("kind".into(), json!("charSize"));
+    o.insert("change".into(), json!("edited"));
+    o.insert("at".into(), json!(format!("{sec}:{para}")));
+    o.insert("section".into(), json!(sec));
+    o.insert("para".into(), json!(para));
+    o.insert("offset".into(), json!(first));
+    o.insert("count".into(), json!(last + 1 - first));
+    if let (Some(b), Some(a)) = (one(before), one(after)) {
+        o.insert("sizePt".into(), json!({"before": b, "after": a}));
+    }
+    Some(Value::Object(o))
+}
+
+/// 글꼴이 바뀐 것을 한 줄로. 한글과 라틴을 따로 적는다 — 둘이 갈리는 것이
+/// 실무의 기본값이고(실측 31%), 합치면 반쪽만 바뀐 것을 못 본다.
+fn font_change(
+    sec: u32,
+    para: u32,
+    before: &[(String, String)],
+    after: &[(String, String)],
+) -> Option<Value> {
+    let n = before.len().max(after.len());
+    let blank = (String::new(), String::new());
+    let at = |v: &[(String, String)], i: usize| v.get(i).unwrap_or(&blank).clone();
+    let first = (0..n).find(|&i| at(before, i) != at(after, i))?;
+    let last = (0..n).rev().find(|&i| at(before, i) != at(after, i)).unwrap_or(first);
+    // 범위 안에서 한 값인지 — 아니면 그 칸을 내지 않는다
+    let one = |v: &[(String, String)], pick: fn(&(String, String)) -> String| -> Option<String> {
+        let x = pick(&at(v, first));
+        (first..=last).all(|i| pick(&at(v, i)) == x).then_some(x)
+    };
+    let mut o = Map::new();
+    o.insert("kind".into(), json!("font"));
+    o.insert("change".into(), json!("edited"));
+    o.insert("at".into(), json!(format!("{sec}:{para}")));
+    o.insert("section".into(), json!(sec));
+    o.insert("para".into(), json!(para));
+    o.insert("offset".into(), json!(first));
+    o.insert("count".into(), json!(last + 1 - first));
+    if let (Some(b), Some(a)) = (one(before, |x| x.0.clone()), one(after, |x| x.0.clone())) {
+        if b != a {
+            o.insert("font".into(), json!({"before": b, "after": a}));
+        }
+    }
+    if let (Some(b), Some(a)) = (one(before, |x| x.1.clone()), one(after, |x| x.1.clone())) {
+        if b != a {
+            o.insert("fontLatin".into(), json!({"before": b, "after": a}));
+        }
+    }
+    Some(Value::Object(o))
+}
+
 fn diff_json(
     before: &Snapshot,
     after: &Snapshot,
@@ -2390,6 +2484,26 @@ fn diff_json(
                     if db != da {
                         let c = deco_change(sec, new_i, db, da);
                         if !c.is_null() {
+                            out.push(c);
+                        }
+                    }
+                }
+
+                // **글자 크기도 보고한다** (hwp-vi#12). #8 에서 꾸밈과 정렬만
+                // 실었고 `set-char` 를 빠뜨렸다 — 적용은 되는데 응답이 비어
+                // 있어서, 받는 쪽은 또 되읽어야 알 수 있었다.
+                if let (Some(sb), Some(sa)) = (before.sizes.get(&oa), after.sizes.get(&new_at)) {
+                    if sb != sa {
+                        if let Some(c) = size_change(sec, new_i, sb, sa) {
+                            out.push(c);
+                        }
+                    }
+                }
+
+                // **글꼴도 보고한다** (hwp-vi#12).
+                if let (Some(fb), Some(fa)) = (before.fonts.get(&oa), after.fonts.get(&new_at)) {
+                    if fb != fa {
+                        if let Some(c) = font_change(sec, new_i, fb, fa) {
                             out.push(c);
                         }
                     }
@@ -2560,6 +2674,16 @@ fn deco_json(t: &Testimony) -> Vec<Value> {
                         // **글자 크기**(pt). 서식을 우리 손으로 쓰려면 되읽어
                         // 대조할 길이 먼저 있어야 한다. 0 이면 모르는 것이다.
                         "sizePt": (r.size_100pt as f64) / 100.0,
+                        // **글꼴 이름** (hwp-vi#12). `set-char` 가 글꼴을
+                        // 거부하고 있던 이유가 이 칸이 없었기 때문이다 —
+                        // 되읽을 수 없는 것은 쓰지 않는다는 규칙에 걸렸다.
+                        //
+                        // 한글과 라틴을 따로 낸다: **코드 블록이 그 둘로
+                        // 갈린다**(본문은 함초롬바탕, 명령·코드는 고정폭).
+                        // 실물은 일곱 언어를 들고 있고, 그 둘이 실무에서
+                        // 갈리는 자리다. 빈 글자면 모르는 것이다.
+                        "font": r.font,
+                        "fontLatin": r.font_latin,
                     })
                 })
                 .collect();

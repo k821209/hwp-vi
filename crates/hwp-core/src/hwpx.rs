@@ -477,15 +477,109 @@ pub fn set_para_style(
 /// **문단 자기 수준의 구간만** 센다. 표 칸 안(`hp:subList` → `hp:p` →
 /// `hp:run`)까지 바꾸면 말하지 않은 것을 바꾼다 — 그림을 넣을 때 같은 자리에서
 /// 한 번 당했다.
-pub fn set_para_char_height(
+/// **그 글꼴을 `hh:fontfaces` 의 언어마다 확보한다** — 있으면 그 번호,
+/// 없으면 더하고 그 번호.
+///
+/// 언어마다 번호가 따로다(실측 s03: HANGUL 23종, 언어 7개). 같은 이름이라도
+/// 번호가 다르므로 언어마다 찾아야 한다.
+///
+/// 일곱 언어를 다 맞추는 이유: `font: "D2Coding"` 은 "이 구간은 이 글꼴" 이라는
+/// 말이다. 한글만 바꾸면 코드(라틴)가 안 바뀌고, 라틴만 바꾸면 한글 주석이
+/// 안 바뀐다 — 실무 문서 구간 752개 중 **233개(31%)가 한글≠라틴** 이므로
+/// 한쪽만 건드리면 반쪽만 바뀐 상태가 흔하게 남는다.
+fn ensure_fonts(pkg: &mut Package, face: &str) -> Result<BTreeMap<String, String>> {
+    const LANGS: &[&str] = &["HANGUL", "LATIN", "HANJA", "JAPANESE", "OTHER", "SYMBOL", "USER"];
+    let name = "Contents/header.xml";
+    let Some(mut hdr) = pkg.text(name) else {
+        bail!("{name} 이 없습니다");
+    };
+    let mut ids: BTreeMap<String, String> = BTreeMap::new();
+
+    for lang in LANGS {
+        // 그 언어 묶음의 범위를 잡는다
+        let open_pat = format!("<hh:fontface lang=\"{lang}\"");
+        let Some(fs) = hdr.find(&open_pat) else {
+            // 그 언어 묶음이 없는 문서도 있다 — 지어내지 않고 건너뛴다.
+            continue;
+        };
+        let Some(fe) = hdr[fs..].find("</hh:fontface>").map(|k| fs + k) else {
+            bail!("`hh:fontface lang=\"{lang}\"` 가 닫히지 않았습니다");
+        };
+        let block = &hdr[fs..fe];
+        // 이미 있나 — `face="이름"` 으로 찾는다
+        let want = format!("face=\"{face}\"");
+        if let Some(at) = block.find(&want) {
+            // 그 `hh:font` 의 id 를 뒤로 찾아 읽는다
+            let head = &block[..at];
+            if let Some(ts) = head.rfind("<hh:font id=\"") {
+                let ts = ts + "<hh:font id=\"".len();
+                if let Some(te) = head[ts..].find('"') {
+                    ids.insert(lang.to_string(), head[ts..ts + te].to_string());
+                    continue;
+                }
+            }
+        }
+        // 없으면 더한다. 번호는 그 묶음에서 가장 큰 것 + 1.
+        let mut max_id = -1i64;
+        let mut rest = block;
+        while let Some(at) = rest.find("<hh:font id=\"") {
+            let s2 = at + "<hh:font id=\"".len();
+            if let Some(e2) = rest[s2..].find('"') {
+                if let Ok(v) = rest[s2..s2 + e2].parse::<i64>() {
+                    max_id = max_id.max(v);
+                }
+            }
+            rest = &rest[s2..];
+        }
+        let new_id = (max_id + 1).to_string();
+        // `typeInfo` 는 넣지 않는다 — 실물에는 있지만 **우리가 모르는 값**이다
+        // (familyType·weight·proportion …). 모르는 값을 지어내는 대신 빼고,
+        // 한글이 받는지는 `convert --verify` 가 본다.
+        let item = format!(
+            "<hh:font id=\"{new_id}\" face=\"{face}\" type=\"TTF\" isEmbedded=\"0\"/>"
+        );
+        hdr.insert_str(fe, &item);
+        // `fontCnt` 를 올린다 — 수가 안 맞으면 한글이 거부할 수 있다
+        let cnt_key = "fontCnt=\"";
+        let seg_end = fs + open_pat.len() + 64;
+        if let Some(cs) = hdr[fs..seg_end.min(hdr.len())].find(cnt_key).map(|k| fs + k + cnt_key.len()) {
+            if let Some(ce) = hdr[cs..].find('"').map(|k| cs + k) {
+                let n: u32 = hdr[cs..ce].parse().unwrap_or(0);
+                hdr.replace_range(cs..ce, &(n + 1).to_string());
+            }
+        }
+        ids.insert(lang.to_string(), new_id);
+    }
+    if ids.is_empty() {
+        bail!("`hh:fontfaces` 에서 어느 언어 묶음도 찾지 못했습니다 — HWPX 가 아닌 듯합니다");
+    }
+    pkg.set_text(name, hdr);
+    Ok(ids)
+}
+
+/// **한 본문 단락의 글자 크기와 글꼴을 바꾼다 — 그 단락만.**
+///
+/// 둘을 한 함수에서 받는 이유: `charPr` 을 한 번만 베낀다. 따로 부르면 서식
+/// 표가 쓸데없이 불어난다.
+pub fn set_para_char(
     pkg: &mut Package,
     section: u32,
     para: u32,
-    height_100pt: u32,
+    height_100pt: Option<u32>,
+    face: Option<&str>,
 ) -> Result<usize> {
-    if height_100pt == 0 {
+    if height_100pt.is_none() && face.is_none() {
+        bail!("바꿀 것이 없습니다 — 크기나 글꼴 중 하나는 주세요");
+    }
+    if height_100pt == Some(0) {
         bail!("글자 크기가 0 입니다");
     }
+    // 글꼴을 먼저 확보한다 — `header.xml` 을 두 번 고치지 않게
+    let font_ids = match face {
+        Some(f) if !f.trim().is_empty() => Some(ensure_fonts(pkg, f.trim())?),
+        Some(_) => bail!("글꼴 이름이 비었습니다"),
+        None => None,
+    };
     let sec_name = format!("Contents/section{section}.xml");
     let Some(sec) = pkg.text(&sec_name) else {
         bail!("구역 {section} 이 없습니다 ({sec_name})");
@@ -572,9 +666,26 @@ pub fn set_para_char_height(
         let base = hdr[cs..ce].to_string();
         added += 1;
         let new_id = max_id + added;
-        let (f1, h1) = set_attr(&base, "<hh:charPr", "height", &height_100pt.to_string(), false);
-        if h1 == 0 {
-            bail!("`charPr` {old_id} 에 `height` 속성이 없습니다");
+        let mut f1 = base.clone();
+        if let Some(h) = height_100pt {
+            let (next, hits) = set_attr(&f1, "<hh:charPr", "height", &h.to_string(), false);
+            if hits == 0 {
+                bail!("`charPr` {old_id} 에 `height` 속성이 없습니다");
+            }
+            f1 = next;
+        }
+        if let Some(ids) = &font_ids {
+            // `hh:fontRef` 는 언어마다 속성이 하나다 — 확보한 번호로 전부 맞춘다
+            let mut hit_any = false;
+            for (lang, id) in ids {
+                let key = lang.to_lowercase();
+                let (next, hits) = set_attr(&f1, "<hh:fontRef", &key, id, false);
+                f1 = next;
+                hit_any |= hits > 0;
+            }
+            if !hit_any {
+                bail!("`charPr` {old_id} 에 `hh:fontRef` 가 없습니다");
+            }
         }
         let (f2, h2) = set_attr(&f1, "<hh:charPr", "id", &new_id.to_string(), false);
         if h2 == 0 {

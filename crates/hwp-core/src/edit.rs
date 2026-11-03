@@ -188,7 +188,18 @@ pub enum Op {
     /// **구간이 아니라 문단 단위다.** 구간을 쪼개는 일은 따로이고, 이슈가 말한
     /// 용도(장·절 제목과 캡션 구분)는 문단 단위로 선다. 부분 구간을 달라고 하면
     /// 이유를 말하며 거부한다 — 조용히 문단 전체를 바꾸지 않는다.
-    SetCharSize { at: Coord, size_100pt: u32 },
+    SetChar {
+        at: Coord,
+        size_100pt: Option<u32>,
+        /// 글꼴 이름. **일곱 언어를 다 맞춘다** — 실무 문서 구간 752개 중
+        /// 233개(31%)가 한글≠라틴이므로 한쪽만 건드리면 반쪽만 바뀐 상태가
+        /// 흔하게 남는다(실측 2026-11-03).
+        ///
+        /// 쓸 수 있게 된 근거: **증인이 구간의 글꼴 이름을 읽는다.** 전에는
+        /// 읽지 못해 거부했다(사용자 보고 hwp-vi#12 — "본문은 함초롬바탕,
+        /// 명령·코드는 고정폭" 이 통째로 막혀 있었다).
+        font: Option<String>,
+    },
     /// `edit delete-table` — 표를 지운다. **단락은 남는다.**
     ///
     /// 사용자 보고(2026-10-29): 다른 세션이 HWPX 의 zip 을 풀어 XML 을 직접
@@ -333,7 +344,7 @@ impl Op {
             ],
             // **우리가 직접 하는 연산은 백엔드 명령이 없다.** 재생 루프가
             // `local()` 을 보고 `apply_local` 로 보낸다.
-            Op::SetParaStyle { .. } | Op::InsertImage { .. } | Op::SetCharSize { .. } => Vec::new(),
+            Op::SetParaStyle { .. } | Op::InsertImage { .. } | Op::SetChar { .. } => Vec::new(),
             Op::SetDeco { at, offset, count, bold, italic, underline } => {
                 let mut props = serde_json::Map::new();
                 for (k, v) in [("bold", bold), ("italic", italic), ("underline", underline)] {
@@ -379,7 +390,7 @@ impl Op {
     ///   키는 값을 절반만 반영한다(실측). 그 위에 연산을 올릴 수 없었다.
     /// - 그림 넣기 — 백엔드에 **명령 자체가 없다**.
     pub fn local(&self) -> bool {
-        matches!(self, Op::SetParaStyle { .. } | Op::InsertImage { .. } | Op::SetCharSize { .. })
+        matches!(self, Op::SetParaStyle { .. } | Op::InsertImage { .. } | Op::SetChar { .. })
     }
 
     /// 우리 손으로 고친다. HWPX 만 된다.
@@ -417,8 +428,10 @@ impl Op {
                     &mut pkg, at.0, at.1, align.map(|a| a.owpml()), indent,
                 )?;
             }
-            Op::SetCharSize { at, size_100pt } => {
-                crate::hwpx::set_para_char_height(&mut pkg, at.0, at.1, *size_100pt)?;
+            Op::SetChar { at, size_100pt, font } => {
+                crate::hwpx::set_para_char(
+                    &mut pkg, at.0, at.1, *size_100pt, font.as_deref(),
+                )?;
             }
             Op::InsertImage { at, part, bytes, width, height, inline, align } => {
                 crate::hwpx::insert_image(
@@ -489,11 +502,16 @@ impl Op {
                 *height as f64 / 100.0,
                 if *inline { "글자처럼" } else { "따로 놓기" }
             ),
-            Op::SetCharSize { at, size_100pt } => format!(
-                "구역{} 단락{} 의 글자 크기를 {:.1}pt 로",
-                at.0, at.1,
-                *size_100pt as f64 / 100.0
-            ),
+            Op::SetChar { at, size_100pt, font } => {
+                let mut what: Vec<String> = Vec::new();
+                if let Some(h) = size_100pt {
+                    what.push(format!("크기 {:.1}pt", *h as f64 / 100.0));
+                }
+                if let Some(f) = font {
+                    what.push(format!("글꼴 {f}"));
+                }
+                format!("구역{} 단락{} 의 {}", at.0, at.1, what.join(" · "))
+            }
             Op::DeleteTable { at, table } => {
                 format!("구역{} 단락{} 의 표{table} 지우기 (단락은 빈 채로 남습니다)", at.0, at.1)
             }
@@ -670,8 +688,16 @@ pub struct Snapshot {
     /// 쓴다) 제자리에서 고치면 문서 전체가 바뀐다 — 그게 이 연산의 주된
     /// 위험이고, 그걸 보려면 **전부** 들어야 한다.
     pub sizes: BTreeMap<Coord, Vec<u32>>,
-    /// 크기를 대조할 단락. `SetCharSize` 가 **전부** 넣는다(공유 때문).
+    /// 보이는 글자마다의 **글꼴**(한글, 라틴). `charPr` 공유 때문에 전수로 든다.
+    ///
+    /// 둘을 함께 드는 이유: 실무 문서 구간 752개 중 **233개(31%)가
+    /// 한글≠라틴** 이다(실측). 하나만 보면 반쪽만 바뀐 것을 못 잡는다 —
+    /// 그리고 반쪽만 바뀐 문서는 코드 블록이 섞여 보이는 바로 그 꼴이다.
+    pub fonts: BTreeMap<Coord, Vec<(String, String)>>,
+    /// 크기를 대조할 단락. `SetChar` 가 **전부** 넣는다(공유 때문).
     pub sizes_checked: std::collections::BTreeSet<Coord>,
+    /// 글꼴을 대조할 단락. 같은 이유로 `SetChar` 가 전부 넣는다.
+    pub fonts_checked: std::collections::BTreeSet<Coord>,
     /// **그림마다의 놓인 크기 · 글자처럼취급 · 바이트 수**, 단락마다 모아서.
     ///
 
@@ -770,6 +796,29 @@ pub fn deco_marks(p: &crate::witness::Para) -> Vec<String> {
     marks
 }
 
+/// 보이는 글자마다의 **글꼴**(한글, 라틴). `size_marks` 와 같은 환산이다.
+pub fn font_marks(p: &crate::witness::Para) -> Vec<(String, String)> {
+    let raw: Vec<char> = p.text.chars().collect();
+    let mut to_visible = vec![usize::MAX; raw.len()];
+    let mut n = 0usize;
+    for (i, c) in raw.iter().enumerate() {
+        if *c != crate::offset::CONTROL {
+            to_visible[i] = n;
+            n += 1;
+        }
+    }
+    let mut marks = vec![(String::new(), String::new()); n];
+    for r in &p.runs {
+        for i in r.start..(r.start + r.len).min(raw.len()) {
+            let v = to_visible[i];
+            if v != usize::MAX {
+                marks[v] = (r.font.clone(), r.font_latin.clone());
+            }
+        }
+    }
+    marks
+}
+
 /// 보이는 글자마다의 **크기**(1/100 pt). `deco_marks` 와 같은 기준이다 —
 /// 구간은 날 글자 기준이고 여기는 보이는 글자 기준이므로 한 칸씩 밀리지 않게
 /// 같은 환산을 쓴다.
@@ -835,6 +884,14 @@ pub fn snapshot(t: &Testimony, path: &Path) -> Snapshot {
         .into_iter()
         .filter_map(|p| p.index.map(|i| ((p.section, i), p.style)))
         .collect();
+    let fonts = t
+        .body_paragraphs()
+        .into_iter()
+        .filter_map(|p| {
+            let i = p.index?;
+            Some(((p.section, i), font_marks(&p)))
+        })
+        .collect();
     let sizes = t
         .body_paragraphs()
         .into_iter()
@@ -879,7 +936,9 @@ pub fn snapshot(t: &Testimony, path: &Path) -> Snapshot {
         deco,
         deco_checked: Default::default(),
         sizes,
+        fonts,
         sizes_checked: Default::default(),
+        fonts_checked: Default::default(),
         images,
         images_elsewhere,
         images_checked: Default::default(),
@@ -1103,6 +1162,7 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 // (hwp-vi#8 을 고치다 찾았다).
                 cur.deco = shift(cur.deco, at.0, at.1, 1);
                 cur.sizes = shift(cur.sizes, at.0, at.1, 1);
+                cur.fonts = shift(cur.fonts, at.0, at.1, 1);
                 cur.paras.insert(*at, String::new());
             }
             Op::InsertTextInCell { table, row, col, cell_para, offset, text } => {
@@ -1177,22 +1237,45 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 cur.images_checked = cur.images.keys().copied().collect();
                 cur.images_elsewhere_checked = true;
             }
-            Op::SetCharSize { at, size_100pt } => {
-                let marks = cur.sizes.get_mut(at).with_context(|| {
-                    format!("없는 단락의 글자 크기를 고치려 합니다: 구역{} 단락{}", at.0, at.1)
-                })?;
-                if marks.is_empty() {
+            Op::SetChar { at, size_100pt, font } => {
+                if size_100pt.is_none() && font.is_none() {
+                    bail!("바꿀 것이 없습니다 — 크기나 글꼴 중 하나는 주세요");
+                }
+                let n = cur
+                    .sizes
+                    .get(at)
+                    .map(|v| v.len())
+                    .with_context(|| {
+                        format!("없는 단락의 글자를 고치려 합니다: 구역{} 단락{}", at.0, at.1)
+                    })?;
+                if n == 0 {
                     bail!(
-                        "구역{} 단락{} 에는 글자가 없습니다 — 크기를 걸 자리가 없습니다",
+                        "구역{} 단락{} 에는 글자가 없습니다 — 걸 자리가 없습니다",
                         at.0, at.1
                     );
                 }
-                for m in marks.iter_mut() {
-                    *m = *size_100pt;
+                if let Some(h) = size_100pt {
+                    if let Some(marks) = cur.sizes.get_mut(at) {
+                        for m in marks.iter_mut() {
+                            *m = *h;
+                        }
+                    }
+                    // **전부 대조한다.** `charPr` 은 심하게 공유되므로
+                    // 제자리에서 고치면 다른 단락이 같이 바뀐다 — 그게 이
+                    // 연산의 주된 위험이다.
+                    cur.sizes_checked = cur.sizes.keys().copied().collect();
                 }
-                // **전부 대조한다.** `charPr` 은 심하게 공유되므로 제자리에서
-                // 고치면 다른 단락이 같이 바뀐다 — 그게 이 연산의 주된 위험이다.
-                cur.sizes_checked = cur.sizes.keys().copied().collect();
+                if let Some(f) = font {
+                    if let Some(marks) = cur.fonts.get_mut(at) {
+                        // **일곱 언어를 다 맞추므로 한글·라틴이 둘 다 그 글꼴**
+                        // 이 된다. 하나만 바뀌면 반쪽만 바뀐 것이고, 그 꼴은
+                        // 코드 블록이 섞여 보이는 바로 그것이다.
+                        for m in marks.iter_mut() {
+                            *m = (f.clone(), f.clone());
+                        }
+                    }
+                    cur.fonts_checked = cur.fonts.keys().copied().collect();
+                }
             }
             Op::SetParaStyle { at, align, first_indent, rest_indent } => {
                 if !cur.paras.contains_key(at) {
@@ -1402,6 +1485,8 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 cur.deco = shift(cur.deco, at.0, at.1, -1);
                 cur.sizes.remove(at);
                 cur.sizes = shift(cur.sizes, at.0, at.1, -1);
+                cur.fonts.remove(at);
+                cur.fonts = shift(cur.fonts, at.0, at.1, -1);
                 cur.styles.remove(at);
                 cur.styles = shift(cur.styles, at.0, at.1, -1);
             }
@@ -1643,6 +1728,31 @@ fn diff_report(
         break;
     }
 
+    // **글꼴이 그 단락만 바뀌었는가.** 크기와 같은 이유로 전수다.
+    for at in &want.fonts_checked {
+        let w = want.fonts.get(at);
+        let g = got.fonts.get(at);
+        if w == g {
+            continue;
+        }
+        match (w, g) {
+            (Some(w), Some(g)) if w.len() == g.len() => {
+                let i = w.iter().zip(g).position(|(a, b)| a != b).unwrap_or(0);
+                lines.push(format!(
+                    "구역{} 단락{} 의 글꼴이 다릅니다 — {i}번째 글자: 기대 (한글 {:?}, 라틴 {:?}) / 실제 (한글 {:?}, 라틴 {:?})",
+                    at.0, at.1, w[i].0, w[i].1, g[i].0, g[i].1
+                ));
+            }
+            _ => lines.push(format!(
+                "구역{} 단락{} 의 글자 수가 달라 글꼴을 견줄 수 없습니다 — 기대 {:?}자 / 실제 {:?}자",
+                at.0, at.1,
+                w.map(|v| v.len()),
+                g.map(|v| v.len())
+            )),
+        }
+        break;
+    }
+
     // **우리가 바꾸겠다고 말한 꾸밈은 들어갔는가.**
     //
     // 백엔드는 `--props` 의 모르는 키를 조용히 무시하고 성공을 보고한다
@@ -1855,6 +1965,8 @@ mod tests {
             deco_checked: Default::default(),
             sizes: Default::default(),
             sizes_checked: Default::default(),
+            fonts: Default::default(),
+            fonts_checked: Default::default(),
             images: Default::default(),
             images_elsewhere: Default::default(),
             images_checked: Default::default(),
