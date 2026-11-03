@@ -4636,7 +4636,7 @@ fn changing_one_paragraphs_alignment_does_not_spread_to_others() {
     let to = if was == ParaAlign::Center { ParaAlign::Right } else { ParaAlign::Center };
 
     let mut log = hwp_core::edit::EditLog::new();
-    log.push(hwp_core::edit::Op::SetParaStyle { at: (0, target), align: Some(to), first_indent: None, rest_indent: None, space_before: None, space_after: None });
+    log.push(hwp_core::edit::Op::SetParaStyle { at: (0, target), align: Some(to), first_indent: None, rest_indent: None, space_before: None, space_after: None, numbered: None });
     hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("정렬 바꾸기: {e:#}"));
 
     let after = aligns(&doc);
@@ -4663,7 +4663,7 @@ fn changing_one_paragraphs_alignment_does_not_spread_to_others() {
     let cfb = dir.join("x.hwp");
     std::fs::copy(&out, &cfb).expect("복사");
     let mut log2 = hwp_core::edit::EditLog::new();
-    log2.push(hwp_core::edit::Op::SetParaStyle { at: (0, target), align: Some(to), first_indent: None, rest_indent: None, space_before: None, space_after: None });
+    log2.push(hwp_core::edit::Op::SetParaStyle { at: (0, target), align: Some(to), first_indent: None, rest_indent: None, space_before: None, space_after: None, numbered: None });
     let e = hwp_core::edit::save(&rhwp, &cfb, &log2).expect_err("`.hwp` 는 거부해야 한다");
     let msg = format!("{e:#}");
     assert!(
@@ -5297,7 +5297,7 @@ fn an_indent_we_write_reads_back_the_same_in_both_formats() {
         at,
         align: None,
         first_indent: Some(0),
-        rest_indent: Some(REST), space_before: None, space_after: None,
+        rest_indent: Some(REST), space_before: None, space_after: None, numbered: None,
     });
     hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("들여쓰기: {e:#}"));
 
@@ -5457,7 +5457,7 @@ fn editing_one_paragraphs_style_clones_the_shared_para_pr() {
         first_indent: Some(0),
         rest_indent: Some(want_rest),
         space_before: None,
-        space_after: None,
+        space_after: None, numbered: None,
     });
     hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("서식 고치기: {e:#}"));
 
@@ -6283,6 +6283,7 @@ fn paragraph_spacing_is_written_and_read_back() {
         rest_indent: None,
         space_before: Some(B),
         space_after: Some(A),
+        numbered: None,
     });
     hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("간격 쓰기: {e:#}"));
 
@@ -6313,6 +6314,111 @@ fn paragraph_spacing_is_written_and_read_back() {
 
     rhwp.run(&["convert", &doc.to_string_lossy(), &dir.join("b.hwp").to_string_lossy(), "--verify"])
         .unwrap_or_else(|e| panic!("백엔드가 우리가 쓴 간격을 거부했다: {e:#}"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **자동 개요 번호를 끌 수 있다** — 번호가 두 번 붙던 것.
+///
+/// 사용자 보고(2026-11-03): 교재 제목이 `2.3.1 원핵생물과 다른 점` 으로
+/// 나왔다. 저자가 쓴 글자는 `3.1 원핵생물과 다른 점` 인데 도구가 앞에 `2.` 를
+/// 붙인 것이다 — **번호가 두 번 붙었고, 그래서 틀린 번호가 됐다.** 교재는
+/// 저자가 직접 번호를 매기므로(제3장, 3.1, 3.2) 끌 수 있어야 한다.
+///
+/// 원인은 `hh:heading/@type="OUTLINE"` 이고, `NONE` 으로 바꾸면 번호만
+/// 사라지고 제목 서식(굵기·크기·간격)은 남는다(실측).
+///
+/// **번호 뒤 공백(`1.서열 정렬`)은 다른 문제다.** 실무 문서 꼴의
+/// `hh:numbering`(`textOffset="50"` PERCENT)을 넣어 봤는데 렌더가 그대로였다 —
+/// 조판기가 `hh:numbering` 을 안 쓰고 번호를 자기가 만든다. 문서로는 못
+/// 고치므로 상류 일이다.
+#[test]
+fn outline_numbering_can_be_turned_off() {
+    let Some((rhwp, _)) = backend() else { return };
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-num-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+    let out = dir.join("num.hwpx");
+
+    // 저자가 **직접 번호를 쓴** 제목 — 교재의 꼴이다
+    let spec = serde_json::json!({
+        "version": "1", "title": "교재",
+        "blocks": [
+            {"type": "heading", "level": 1, "text": "제3장 진핵생물 데이터 분석"},
+            {"type": "paragraph", "text": "본문."},
+            {"type": "heading", "level": 2, "text": "3.1 원핵생물과 다른 점"},
+            {"type": "paragraph", "text": "본문."},
+        ],
+    });
+    let r = hwp_core::create::create(&rhwp, &spec, &out, false)
+        .unwrap_or_else(|e| panic!("만들기: {e:#}"));
+
+    let styles = |p: &std::path::Path| -> std::collections::BTreeMap<(u32, u32), hwp_core::witness::ParaStyle> {
+        let t = Testimony::read(p).expect("증인");
+        hwp_core::edit::snapshot(&t, p).styles
+    };
+    // 제목 블록은 **번호가 켜진 채로** 만들어진다 — 그래야 끄는 일이 뜻이 있다
+    let heads: Vec<(u32, u32)> = r
+        .blocks_at
+        .iter()
+        .filter(|b| b.kind == "heading")
+        .filter_map(|b| b.at)
+        .collect();
+    assert_eq!(heads.len(), 2, "제목 두 개가 보고돼야 한다: {:?}", r.blocks_at);
+    let before = styles(&out);
+    assert!(
+        heads.iter().all(|c| before.get(c).map(|s| s.numbered).unwrap_or(false)),
+        "제목이 자동 번호 없이 만들어졌다 — 끄는 일이 뜻을 잃는다: {:?}",
+        heads.iter().map(|c| before.get(c).map(|s| s.numbered)).collect::<Vec<_>>()
+    );
+
+    let mut log = hwp_core::edit::EditLog::new();
+    for c in &heads {
+        log.push(hwp_core::edit::Op::SetParaStyle {
+            at: *c,
+            align: None,
+            first_indent: None,
+            rest_indent: None,
+            space_before: None,
+            space_after: None,
+            numbered: Some(false),
+        });
+    }
+    hwp_core::edit::save(&rhwp, &out, &log).unwrap_or_else(|e| panic!("번호 끄기: {e:#}"));
+
+    let after = styles(&out);
+    for c in &heads {
+        assert_eq!(
+            after.get(c).map(|s| s.numbered),
+            Some(false),
+            "구역{} 단락{} 의 자동 번호가 꺼지지 않았다",
+            c.0, c.1
+        );
+        // **글자는 그대로** — 번호만 끄라고 했다
+        let t = Testimony::read(&out).expect("증인");
+        let txt = t
+            .body_paragraphs()
+            .into_iter()
+            .find(|p| (p.section, p.index.unwrap_or(u32::MAX)) == *c)
+            .map(|p| hwp_core::offset::visible(&p.text).trim().to_string())
+            .unwrap_or_default();
+        assert!(
+            txt.starts_with("제3장") || txt.starts_with("3.1"),
+            "제목 글자가 바뀌었다: {txt:?}"
+        );
+    }
+
+    // ---- **백엔드도 번호를 안 붙이는가.** 우리 증인만의 말이 아니어야 한다.
+    //      `rhwp dump` 는 개요 번호가 있을 때만 `head=` 줄을 낸다(실측).
+    let back = dir.join("num.hwp");
+    rhwp.run(&["convert", &out.to_string_lossy(), &back.to_string_lossy(), "--verify"])
+        .unwrap_or_else(|e| panic!("백엔드가 거부했다: {e:#}"));
+    let dump = rhwp.run(&["dump", &back.to_string_lossy()]).expect("덤프");
+    let text = String::from_utf8_lossy(&dump);
+    assert!(
+        !text.contains("head=Outline"),
+        "백엔드가 아직 개요 번호를 본다 — 끈 것이 전해지지 않았다"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -319,6 +319,19 @@ pub struct ParaStyle {
     pub space_before: i64,
     /// 문단 **아래** 간격 (HWPUNIT).
     pub space_after: i64,
+    /// **자동 개요 번호가 켜져 있는가** (`hh:heading/@type == "OUTLINE"`).
+    ///
+    /// 사용자 보고(2026-11-03): 교재 원고의 제목이 `2.3.1 원핵생물과 다른 점`
+    /// 으로 나왔다. 저자가 쓴 글자는 `3.1 원핵생물과 다른 점` 인데 도구가
+    /// 그 앞에 `2.` 를 붙인 것이다 — **번호가 두 번 붙었고, 그래서 틀린
+    /// 번호가 됐다.** 교재는 저자가 직접 번호를 매기므로(제3장, 3.1, 3.2)
+    /// 자동 번호를 끌 수 있어야 한다.
+    ///
+    /// **HWPX 에서만 읽는다.** HWP5 의 `PARA_SHAPE` 어느 비트인지 재지
+    /// 않았다 — `rhwp dump` 는 `head=Outline` 줄로 보여주지만 그건 백엔드의
+    /// 해석이고 우리 판독기의 비트 자리가 아니다. 우리는 HWPX 만 쓰므로
+    /// 쓰는 포맷에서는 되읽어 대조된다. 재면 그때 넓힌다.
+    pub numbered: bool,
 }
 
 /// 문단 정렬. 터미널은 양쪽맞춤을 할 수 없어 `Justify`·`Distribute`·`Division`
@@ -1249,6 +1262,8 @@ fn para_shapes(doc_info: &[u8]) -> Vec<ParaStyle> {
             rest_indent: (left + (-intent).max(0)) / 2,
             space_before: prev / 2,
             space_after: next / 2,
+            // HWP5 의 비트 자리를 재지 않았다 — 모르는 것을 참이라고 하지 않는다
+            numbered: false,
         });
     }
     out
@@ -1722,6 +1737,7 @@ fn para_styles_from_header(xml: &str) -> HashMap<String, ParaStyle> {
     let mut intent = 0i64;
     let mut prev = 0i64;
     let mut next = 0i64;
+    let mut numbered = false;
 
     loop {
         let ev = match reader.read_event() {
@@ -1742,10 +1758,16 @@ fn para_styles_from_header(xml: &str) -> HashMap<String, ParaStyle> {
                         intent = 0;
                         prev = 0;
                         next = 0;
+                        numbered = false;
                     }
                     "hp:case" => {
                         in_hwpunit = attr(e, "hp:required-namespace")
                             .is_some_and(|v| v.contains("HwpUnitChar"));
+                    }
+                    "hh:heading" => {
+                        if open.is_some() {
+                            numbered = attr(e, "type").as_deref() == Some("OUTLINE");
+                        }
                     }
                     "hh:align" => {
                         if open.is_some() {
@@ -1789,6 +1811,7 @@ fn para_styles_from_header(xml: &str) -> HashMap<String, ParaStyle> {
                                     rest_indent: l + (-i).max(0),
                                     space_before: pv,
                                     space_after: nx,
+                                    numbered,
                                 },
                             );
                         }

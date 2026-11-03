@@ -374,6 +374,8 @@ pub fn set_para_style(
     indent: Option<(i64, i64)>,
     // `(위 간격, 아래 간격)` — HWPUNIT. 1 pt = 100.
     space: Option<(i64, i64)>,
+    // 자동 개요 번호를 켤지 끌지. `None` 이면 건드리지 않는다.
+    numbered: Option<bool>,
 ) -> Result<()> {
     let sec_name = format!("Contents/section{section}.xml");
     let Some(sec) = pkg.text(&sec_name) else {
@@ -485,6 +487,27 @@ pub fn set_para_style(
             }
         };
         fresh = set_margin_indent(&fresh, l, i, space)?;
+    }
+    if let Some(on) = numbered {
+        // **자동 번호는 `hh:heading/@type` 하나다.** `OUTLINE` 이면 조판기가
+        // 제목 앞에 번호를 붙이고, `NONE` 이면 안 붙인다.
+        //
+        // 실측(2026-11-03): `NONE` 으로 바꾸면 번호만 사라지고 제목 서식
+        // (굵기·크기·간격)은 그대로다. `convert --verify` 도 IR 차이 없음.
+        //
+        // `level`·`idRef` 는 건드리지 않는다 — 다시 켤 때 쓰는 값이고,
+        // 우리가 지어낼 값이 아니다.
+        let (next, hits) = set_attr(
+            &fresh,
+            "<hh:heading",
+            "type",
+            if on { "OUTLINE" } else { "NONE" },
+            false,
+        );
+        if hits == 0 {
+            bail!("`paraPr` {old_id} 에 `hh:heading/@type` 이 없습니다");
+        }
+        fresh = next;
     }
     let (f2, idh) = set_attr(&fresh, "<hh:paraPr", "id", &new_id.to_string(), false);
     if idh == 0 {

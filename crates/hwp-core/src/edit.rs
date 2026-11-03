@@ -140,6 +140,13 @@ pub enum Op {
         /// 견줘 확인했다(단락 318개, 어긋남 0, 그중 205개가 간격을 가진다).
         space_before: Option<i64>,
         space_after: Option<i64>,
+        /// **자동 개요 번호를 켤지 끌지.**
+        ///
+        /// 사용자 보고(2026-11-03): 교재 제목이 `2.3.1 원핵생물과 다른 점` 으로
+        /// 나왔다. 저자가 쓴 글자는 `3.1 …` 인데 도구가 앞에 `2.` 를 붙였다 —
+        /// **번호가 두 번 붙어 틀린 번호가 됐다.** 교재는 저자가 직접 번호를
+        /// 매기므로 끌 수 있어야 한다.
+        numbered: Option<bool>,
     },
     /// **그림을 넣는다 — 우리가 직접.** 백엔드에 해당 명령이 없다.
     ///
@@ -423,7 +430,7 @@ impl Op {
         }
         let mut pkg = crate::hwpx::Package::open(src)?;
         match self {
-            Op::SetParaStyle { at, align, first_indent, rest_indent, space_before, space_after } => {
+            Op::SetParaStyle { at, align, first_indent, rest_indent, space_before, space_after, numbered } => {
                 let indent = match (first_indent, rest_indent) {
                     (None, None) => None,
                     (Some(f), Some(r)) => Some((*f, *r)),
@@ -442,7 +449,7 @@ impl Op {
                     ),
                 };
                 crate::hwpx::set_para_style(
-                    &mut pkg, at.0, at.1, align.map(|a| a.owpml()), indent, space,
+                    &mut pkg, at.0, at.1, align.map(|a| a.owpml()), indent, space, *numbered,
                 )?;
             }
             Op::SetChar { at, size_100pt, font } => {
@@ -481,10 +488,13 @@ impl Op {
                     lines[0]
                 ),
             },
-            Op::SetParaStyle { at, align, first_indent, rest_indent, space_before, space_after } => {
+            Op::SetParaStyle { at, align, first_indent, rest_indent, space_before, space_after, numbered } => {
                 let mut what: Vec<String> = Vec::new();
                 if let Some(a) = align {
                     what.push(format!("정렬 {}", a.label()));
+                }
+                if let Some(n) = numbered {
+                    what.push(format!("자동 개요 번호 {}", if *n { "켜기" } else { "끄기" }));
                 }
                 if let (Some(b), Some(a)) = (space_before, space_after) {
                     what.push(format!("간격 위 {:.1}pt · 아래 {:.1}pt", *b as f64 / 100.0, *a as f64 / 100.0));
@@ -1297,7 +1307,7 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                     cur.fonts_checked = cur.fonts.keys().copied().collect();
                 }
             }
-            Op::SetParaStyle { at, align, first_indent, rest_indent, space_before, space_after } => {
+            Op::SetParaStyle { at, align, first_indent, rest_indent, space_before, space_after, numbered } => {
                 if !cur.paras.contains_key(at) {
                     bail!("없는 단락입니다: 구역{} 단락{}", at.0, at.1);
                 }
@@ -1306,6 +1316,7 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                     && rest_indent.is_none()
                     && space_before.is_none()
                     && space_after.is_none()
+                    && numbered.is_none()
                 {
                     bail!(
                         "바꿀 것이 없습니다 — `align`·`firstIndent`·`restIndent`·\
@@ -1327,6 +1338,9 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 }
                 if let Some(a) = space_after {
                     st.space_after = *a;
+                }
+                if let Some(n) = numbered {
+                    st.numbered = *n;
                 }
                 cur.styles.insert(*at, st);
                 // **모든 단락을 대조 대상에 넣는다.**
@@ -1671,7 +1685,7 @@ fn diff_report(
                     st.rest_indent as f64 / 7200.0 * 25.4,
                     st.space_before as f64 / 100.0,
                     st.space_after as f64 / 100.0
-                ),
+                ) + if st.numbered { " · 자동번호" } else { "" },
                 None => "없음".to_string(),
             };
             let which = match (w, g) {
@@ -1680,6 +1694,7 @@ fn diff_report(
                 (Some(a), Some(b)) if a.rest_indent != b.rest_indent => "나머지 줄 들여쓰기",
                 (Some(a), Some(b)) if a.space_before != b.space_before => "문단 위 간격",
                 (Some(a), Some(b)) if a.space_after != b.space_after => "문단 아래 간격",
+                (Some(a), Some(b)) if a.numbered != b.numbered => "자동 개요 번호",
                 _ => "문단 서식",
             };
             lines.push(format!(

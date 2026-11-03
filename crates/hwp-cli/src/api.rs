@@ -271,6 +271,13 @@ pub enum OpSpec {
         space_before_pt: Option<f64>,
         #[serde(rename = "spaceAfterPt", alias = "space_after_pt")]
         space_after_pt: Option<f64>,
+        /// **자동 개요 번호를 켤지 끌지.**
+        ///
+        /// 사용자 보고(2026-11-03): 교재 제목이 `2.3.1 원핵생물과 다른 점` 으로
+        /// 나왔다. 저자가 쓴 글자는 `3.1 …` 인데 도구가 앞에 `2.` 를 붙였다 —
+        /// **번호가 두 번 붙어 틀린 번호가 됐다.** 교재는 저자가 직접 번호를
+        /// 매기므로(제3장, 3.1, 3.2) 끌 수 있어야 한다.
+        numbered: Option<bool>,
     },
     /// **그림을 넣는다** — 그 단락의 첫 구간 안에 놓는다.
     ///
@@ -1966,7 +1973,7 @@ fn lower(
                 (!said.is_empty()).then(|| format!("{} (단락 전체)", said.join(" · "))),
             )
         }
-        OpSpec::SetParaStyle { section, para, align, first_indent, rest_indent, space_before_pt, space_after_pt } => {
+        OpSpec::SetParaStyle { section, para, align, first_indent, rest_indent, space_before_pt, space_after_pt, numbered } => {
             text_at(*section, *para)?;
             use hwp_core::witness::ParaAlign;
             let a = match align.as_deref().map(|s| s.trim().to_lowercase()) {
@@ -1989,10 +1996,11 @@ fn lower(
                 && rest_indent.is_none()
                 && space_before_pt.is_none()
                 && space_after_pt.is_none()
+                && numbered.is_none()
             {
                 anyhow::bail!(
                     "바꿀 것을 주라 — `align`·`firstIndent`·`restIndent`·\
-                     `spaceBeforePt`·`spaceAfterPt` 중 하나는 있어야 한다"
+                     `spaceBeforePt`·`spaceAfterPt`·`numbered` 중 하나는 있어야 한다"
                 );
             }
             // **간격은 한쪽만 줘도 된다** — 나머지는 지금 값에서 온다.
@@ -2062,6 +2070,7 @@ fn lower(
                     rest_indent: ri,
                     space_before: sb,
                     space_after: sa,
+                    numbered: *numbered,
                 }],
                 said,
             )
@@ -2168,6 +2177,7 @@ fn lower(
                         rest_indent: None,
                         space_before: None,
                         space_after: None,
+                        numbered: None,
                     });
                     let has_text = !cur
                         .paras
@@ -2708,6 +2718,13 @@ fn styles_json(t: &Testimony) -> Vec<Value> {
                 // (hwp-vi#12 에서 배운 순서다). 1 pt = 100 HWPUNIT.
                 "spaceBeforePt": (p.style.space_before as f64) / 100.0,
                 "spaceAfterPt": (p.style.space_after as f64) / 100.0,
+                // **자동 개요 번호가 켜져 있나.** 켜져 있으면 조판기가 제목
+                // 앞에 번호를 붙인다 — 저자가 직접 번호를 쓴 교재에서는
+                // 번호가 두 번 붙어 틀린 번호가 된다(`2.3.1`).
+                //
+                // HWPX 에서만 읽는다. HWP5 의 비트 자리를 재지 않았다 —
+                // 모르는 것을 참이라고 하지 않는다.
+                "numbered": p.style.numbered,
                 // 들여쓰기는 HWPUNIT (1pt = 100)
                 "firstIndent": p.style.first_indent,
                 "restIndent": p.style.rest_indent,
@@ -3206,7 +3223,7 @@ mod tests {
         let local: Vec<(&str, bool)> = vec![
             (
                 "set-para-style",
-                Op::SetParaStyle { at: (0, 0), align: Some(ParaAlign::Center), first_indent: None, rest_indent: None, space_before: None, space_after: None }.local(),
+                Op::SetParaStyle { at: (0, 0), align: Some(ParaAlign::Center), first_indent: None, rest_indent: None, space_before: None, space_after: None, numbered: None }.local(),
             ),
             (
                 "set-deco",

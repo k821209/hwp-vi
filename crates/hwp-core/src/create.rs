@@ -600,7 +600,7 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result
                     crate::images::Align::Right => "RIGHT",
                     crate::images::Align::Left => "LEFT",
                 };
-                crate::hwpx::set_para_style(&mut pkg, at.0, at.1, Some(owpml), None, None)
+                crate::hwpx::set_para_style(&mut pkg, at.0, at.1, Some(owpml), None, None, None)
                     .with_context(|| format!("그림 {n} 의 문단 정렬"))?;
             }
             // **표지를 지운다.** 남으면 문서에 쓰레기 글자가 박힌다 —
