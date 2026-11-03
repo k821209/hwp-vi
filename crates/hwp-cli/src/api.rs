@@ -1160,7 +1160,10 @@ pub fn run(req: Request) -> Result<Value> {
             }
         }
         if want("images") {
-            out.insert("images".into(), json!(images_json(&target)?));
+            // 증인이 필요하다 — 글자처럼 취급하는 그림의 가로 자리는 **문단**이
+            // 정하므로(hwp-vi#7), 컨테이너만 읽으면 그 답을 말할 수 없다.
+            let t = Testimony::read(&target)?;
+            out.insert("images".into(), json!(images_json(&target, &t)?));
         }
         if want("symbols") {
             out.insert("symbols".into(), json!(symbols_json()));
@@ -2053,6 +2056,54 @@ struct Shift {
 /// 칸씩 밀리는데, 그것을 "바뀌었다" 로 세면 보고가 수십 줄이 되고 정작 넣은
 /// 줄이 묻힌다. 그래서 넣고 뺀 자리를 먼저 반영해 **같은 글자를 같은 글자에**
 /// 맞추고, 그래도 다른 것만 보고한다.
+/// 글자 꾸밈이 바뀐 것을 한 줄로. **구간을 다시 구해 적는다** — 글자마다의
+/// 표를 그대로 내면 받는 쪽이 어디가 바뀐지 세어야 한다.
+///
+/// 바뀐 **범위**(첫 다른 글자 ~ 마지막 다른 글자)를 구하고, 그 범위에서
+/// 속성마다 "전부 켜져 있나" 를 전·후로 견준다. 범위 안에서 섞여 있으면
+/// 그 속성은 `null` 로 둔다 — 한 값으로 말할 수 없는 것을 말하지 않는다.
+fn deco_change(sec: u32, para: u32, before: &[String], after: &[String]) -> Value {
+    let n = before.len().max(after.len());
+    fn at(v: &[String], i: usize) -> &str {
+        v.get(i).map(String::as_str).unwrap_or("")
+    }
+    let Some(first) = (0..n).find(|&i| at(before, i) != at(after, i)) else {
+        // **글자마다의 속성이 하나도 다르지 않다.** 표의 길이만 다른 꼴인데,
+        // 그건 두 다른 단락을 견준 것이므로 보고할 바뀜이 없다. 비교가 어긋나
+        // 가짜 항목을 내던 자리라서 여기서 한 번 더 막는다.
+        return Value::Null;
+    };
+    let last = (0..n).rev().find(|&i| at(before, i) != at(after, i)).unwrap_or(first);
+    let count = last + 1 - first;
+
+    let all_or_none = |v: &[String], c: char| -> Option<bool> {
+        let on = (first..=last).filter(|&i| at(v, i).contains(c)).count();
+        if on == count {
+            Some(true)
+        } else if on == 0 {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    let mut o = Map::new();
+    o.insert("kind".into(), json!("deco"));
+    o.insert("change".into(), json!("edited"));
+    o.insert("at".into(), json!(format!("{sec}:{para}")));
+    o.insert("section".into(), json!(sec));
+    o.insert("para".into(), json!(para));
+    o.insert("offset".into(), json!(first));
+    o.insert("count".into(), json!(count));
+    for (key, c) in [("bold", 'B'), ("italic", 'I'), ("underline", 'U'), ("strike", 'S')] {
+        let b = all_or_none(before, c);
+        let a = all_or_none(after, c);
+        if b != a {
+            o.insert(key.into(), json!({"before": b, "after": a}));
+        }
+    }
+    Value::Object(o)
+}
+
 fn diff_json(
     before: &Snapshot,
     after: &Snapshot,
@@ -2125,6 +2176,73 @@ fn diff_json(
                     "para": new_i,
                     "after": a,
                 })),
+            }
+
+            // **서식 연산도 보고한다** (hwp-vi#8).
+            //
+            // 전에는 글자를 바꾸는 연산만 `changed` 에 실렸다. 그래서 부르는
+            // 쪽이 **같은 요청의 결과를 두 가지 방식으로** 확인해야 했다 —
+            // 글자는 응답으로, 서식은 되읽기로. 여러 연산을 한 요청에 섞는
+            // 것이 이 API 의 설계인데 그 중 일부만 보고되면 "요청 하나,
+            // 응답 하나" 가 반만 지켜진다.
+            //
+            // 밀린 자리는 위에서 이미 푼 `origin` 을 쓴다 — 좌표 셈을 두
+            // 군데 적으면 반드시 어긋난다.
+            let old_at = origin.get(slot).copied().flatten().map(|o| (sec, o));
+            let new_at = (sec, new_i);
+
+            if let Some(oa) = old_at {
+                let wb = before.styles.get(&oa);
+                let wa = after.styles.get(&new_at);
+                if wb != wa {
+                    let name = |x: Option<&hwp_core::witness::ParaAlign>| {
+                        x.map(|a| format!("{a:?}").to_lowercase())
+                    };
+                    out.push(json!({
+                        "kind": "style",
+                        "change": "edited",
+                        "at": format!("{sec}:{new_i}"),
+                        "section": sec,
+                        "para": new_i,
+                        "align": {"before": name(wb), "after": name(wa)},
+                    }));
+                }
+
+                if let (Some(db), Some(da)) = (before.deco.get(&oa), after.deco.get(&new_at)) {
+                    if db != da {
+                        let c = deco_change(sec, new_i, db, da);
+                        if !c.is_null() {
+                            out.push(c);
+                        }
+                    }
+                }
+            }
+
+            // 그림 — 그 단락에서 **늘어난** 것을 적는다. 줄어드는 길은
+            // `delete-control` 인데 그쪽은 무엇을 지웠는지 모르므로(표인지
+            // 그림인지) 여기서 말하지 않는다.
+            let empty: Vec<hwp_core::edit::ImageFact> = Vec::new();
+            let ib = old_at.and_then(|oa| before.images.get(&oa)).unwrap_or(&empty);
+            let ia = after.images.get(&new_at).unwrap_or(&empty);
+            for f in ia {
+                let had = ib.iter().filter(|x| x == &f).count();
+                let has = ia.iter().filter(|x| x == &f).count();
+                if has > had && ib.iter().all(|x| x.name != f.name) {
+                    let mm = |v: u32| (v as f64 / 100.0 * 25.4 / 72.0 * 10.0).round() / 10.0;
+                    let (w, h) = f.placed.unwrap_or((0, 0));
+                    out.push(json!({
+                        "kind": "image",
+                        "change": "added",
+                        "at": format!("{sec}:{new_i}"),
+                        "section": sec,
+                        "para": new_i,
+                        "name": f.name,
+                        "widthMm": mm(w),
+                        "heightMm": mm(h),
+                        "inline": f.inline,
+                        "bytes": f.bytes,
+                    }));
+                }
             }
         }
         for old_i in gone {
@@ -2340,10 +2458,54 @@ fn symbols_json() -> Vec<Value> {
         .collect()
 }
 
-fn images_json(path: &std::path::Path) -> Result<Vec<Value>> {
+/// **`align` 은 그 그림의 가로 자리를 실제로 정하는 것이다** — 개체 속성이
+/// 아니다.
+///
+/// 사용자 보고(hwp-vi#7): `align:"center"` 로 넣고 되읽으니 `align` 이 `left`
+/// 여서 "받고 검사한 뒤 버린다" 로 보였다. 문단 정렬은 `center` 였으므로
+/// 정렬은 **적용된 상태**였는데, 이 칸이 개체 속성(`hp:pos/@horzAlign`)을
+/// 돌려주고 있어서 **"가운데인가" 를 묻는 사람에게 틀린 답**을 줬다.
+///
+/// 글자처럼 취급하는 그림은 글자 흐름을 타므로 가로 자리를 **문단**이 정한다.
+/// 실무 문서가 그렇게 한다(실측 14개 문서, 그림 43개: 개체 정렬은 전부 `LEFT`
+/// 이고 가운데 맞춘 그림은 문단이 가운데 — center 3 · right 2).
+///
+/// 그래서 `align` 은 **실효 정렬**을 돌려주고, 어디서 왔는지(`alignFrom`)와
+/// 개체 속성 원값(`objectAlign`)을 함께 낸다. 숨기면 같은 혼동이 반대 방향으로
+/// 돌아온다.
+///
+/// **`alignFrom: "paragraph"` 면 `align` 의 값 범위가 넓다.** 문단 정렬이므로
+/// `left`·`center`·`right` 말고 `justify`·`distribute`·`division` 도 나온다
+/// (실측: 실무 문서 그림 43개 중 28개가 `justify` 다 — 가장 흔한 값이다).
+/// `objectAlign` 만 셋으로 닫혀 있다.
+fn images_json(path: &std::path::Path, t: &Testimony) -> Result<Vec<Value>> {
+    let para_align: std::collections::HashMap<(u32, u32), String> = t
+        .body_paragraphs()
+        .into_iter()
+        .filter_map(|p| {
+            let i = p.index?;
+            // **`styles` 와 같은 기계 값**이어야 한다. `label()` 은 사람에게
+            // 보여 줄 한국어라서, 그걸 내면 `align` 과 `objectAlign` 이 서로
+            // 다른 말을 쓰고 받는 쪽이 둘을 견줄 수 없다.
+            Some((
+                (p.section, i),
+                format!("{:?}", p.style.align).to_lowercase(),
+            ))
+        })
+        .collect();
     Ok(hwp_core::images::read(path)?
         .into_iter()
         .map(|img| {
+            let obj = format!("{:?}", img.align).to_lowercase();
+            // 글자처럼이고 본문 단락에 올라앉았으면 문단이 정한다.
+            let from_para = img
+                .at
+                .filter(|_| img.inline)
+                .and_then(|at| para_align.get(&at).cloned());
+            let (effective, from) = match from_para {
+                Some(a) => (a, "paragraph"),
+                None => (obj.clone(), "object"),
+            };
             json!({
                 "index": img.index,
                 "name": img.name,
@@ -2351,7 +2513,9 @@ fn images_json(path: &std::path::Path) -> Result<Vec<Value>> {
                 "at": img.at.map(|(s, p)| format!("{s}:{p}")),
                 "placedHwpunit": img.placed.map(|(w, h)| json!([w, h])),
                 "inline": img.inline,
-                "align": format!("{:?}", img.align).to_lowercase(),
+                "align": effective,
+                "alignFrom": from,
+                "objectAlign": obj,
                 "cell": img.cell.map(|c| json!({"table": c.table, "row": c.row, "col": c.col})),
             })
         })

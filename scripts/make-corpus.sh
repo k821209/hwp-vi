@@ -112,7 +112,35 @@ cat > /tmp/c03.json <<'EOF'
  ]}
 EOF
 
-for n in c00 c01 c02 c03; do
+# ---------------------------------------------------------------- c04: 그림 배치
+#
+# **실무 문서의 그림은 전부 "글자처럼 취급" 이고 가운데 맞춤은 문단이 한다.**
+# 실측(실무 문서 14개, 그림 43개): 개체 정렬이 전부 `LEFT` 이고, 떠 있는 그림은
+# 0개, 그림이 올라앉은 문단은 center 3 · right 2 다.
+#
+# 그런데 c00 의 그림은 백엔드 `insert-image` 로 붙여 **떠 있는 그림**이다
+# (`--page/--x/--y` 는 본질적으로 그렇다). 그래서 합성 코퍼스가 **가장 흔한
+# 꼴을 안 덮고 있었다** — 사용자 보고(hwp-vi#7)가 그 틈에서 나왔다: 되읽은
+# `align` 이 개체 속성이어서 "가운데로 넣었는데 left 로 읽힌다" 로 보였다.
+#
+# **한계를 적어 둔다.** 이 문서는 우리 `create` 가 만든다. 그러니 "우리가 쓴
+# 것을 우리가 읽는다" 이고, 쓰기가 틀리면 코퍼스도 같이 틀린다. 쓰기 쪽은
+# 저장 검증과 `convert --verify` 가 따로 본다 — 여기서 묻는 것은 **읽기**다:
+# 글자처럼 취급하는 그림의 가로 자리를 문단에서 가져오는가.
+cat > /tmp/c04.json <<EOF
+{"version":"1","title":"그림이 든 보고서",
+ "blocks":[
+  {"type":"heading","level":1,"text":"1. 분석 개요"},
+  {"type":"paragraph","text":"아래 모식도가 전체 흐름을 보여준다."},
+  {"type":"image","path":"$SRC/logo.png","widthMm":80,"align":"center"},
+  {"type":"paragraph","text":"그림 1. 분석 흐름도"},
+  {"type":"paragraph","text":"오른쪽에 붙이는 작은 기호도 쓴다."},
+  {"type":"image","path":"$SRC/spectrum.png","widthMm":30,"align":"right"},
+  {"type":"paragraph","text":"그림 2. 눈금 보기"}
+ ]}
+EOF
+
+for n in c00 c01 c02 c03 c04; do
   echo "{\"create\":$(cat /tmp/$n.json),\"output\":\"$DEST/$n.hwpx\"}" \
     | "$HWP" api --compact > /tmp/$n.out 2>&1 \
     || { echo "만들기 실패 ($n):" >&2; cat /tmp/$n.out >&2; exit 1; }
@@ -220,6 +248,7 @@ cat > "$DEST/MANIFEST.json" <<EOF
     "접히는 긴 단락 (커서 오프셋 회귀)",
     "East Asian Ambiguous 글자 (가운뎃점)",
     "그림 — 투명 여백이 있는 것과 색이 많은 것",
+    "그림 배치 — 글자처럼 취급(실무 문서의 전부) + 문단으로 가운데·오른쪽 맞춤",
     "체크박스 (□ ☑) — 본문과 표 칸, 한 칸에 여러 개",
     "꾸민 구간 안의 글자 (진하게) — 글자 속성이 사는지 보는 관문"
   ],

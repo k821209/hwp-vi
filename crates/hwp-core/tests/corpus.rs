@@ -5104,3 +5104,147 @@ fn a_spec_with_an_image_block_produces_a_document_with_that_image() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **단락을 넣고 빼면 꾸밈·정렬 지도도 같이 밀려야 한다.**
+///
+/// 사용자 보고(hwp-vi#8)를 고치다 찾았다. `expected` 가 `paras`·`styles`·
+/// `drawings`·`images` 는 밀면서 `deco` 는 밀지 않았다. 저장 검증은
+/// `deco_checked` 를 비우므로 걸리지 않았는데, 지도가 `paras` 와 **다른
+/// 문서를 가리키는** 상태는 그걸 읽는 쪽에서 조용히 틀린다 — `changed` 에
+/// 서식을 실으면서 가짜 항목으로 드러났다.
+///
+/// 대조를 끄는 것과 지도를 안 고치는 것은 다른 일이다.
+#[test]
+fn inserting_a_paragraph_shifts_the_decoration_and_alignment_maps_too() {
+    let Some(files) = Some(samples()) else { return };
+    let Some(src) = files.into_iter().next() else { return };
+    let t = Testimony::read(&src).expect("증인");
+    let before = hwp_core::edit::snapshot(&t, &src);
+    // 꾸밈 표가 있는 단락 하나를 고른다 — 그 뒤에 단락을 넣는다
+    let Some((&at, marks)) = before.deco.iter().find(|(_, m)| !m.is_empty()) else {
+        panic!("꾸밈 표가 있는 단락이 없다");
+    };
+    let marks = marks.clone();
+
+    let after = hwp_core::edit::expected(
+        &before,
+        &[hwp_core::edit::Op::InsertParagraph { at }],
+    )
+    .expect("예측");
+
+    // 그 단락은 한 칸 뒤로 밀렸다
+    let moved = (at.0, at.1 + 1);
+    assert_eq!(
+        after.deco.get(&moved),
+        Some(&marks),
+        "꾸밈 표가 밀리지 않았다 — {at:?} 의 표가 {moved:?} 에 있어야 한다"
+    );
+    assert_eq!(
+        after.paras.get(&moved),
+        before.paras.get(&at),
+        "글자가 밀린 자리와 꾸밈이 밀린 자리가 달라서는 안 된다"
+    );
+    assert_eq!(
+        after.styles.get(&moved),
+        before.styles.get(&at),
+        "정렬이 밀리지 않았다"
+    );
+    // 새로 넣은 자리에는 꾸밈 표가 없다 (빈 단락)
+    assert!(
+        after.deco.get(&at).map(|m| m.is_empty()).unwrap_or(true),
+        "넣은 빈 단락에 꾸밈 표가 남아 있다"
+    );
+}
+
+/// **`images[].align` 은 그 그림의 가로 자리를 실제로 정하는 것이어야 한다.**
+///
+/// 사용자 보고(hwp-vi#7): `align:"center"` 로 넣고 되읽으니 `left` 여서 "받고
+/// 검사한 뒤 버린다" 로 보였다. 재 보니 문단 정렬은 `center` 였다 — 정렬은
+/// **적용된 상태**였고, 이 칸이 개체 속성(`hp:pos/@horzAlign`)을 돌려주고
+/// 있어서 **"가운데인가" 를 묻는 사람에게 틀린 답**을 준 것이었다.
+///
+/// 글자처럼 취급하는 그림은 글자 흐름을 타므로 가로 자리를 문단이 정한다.
+/// 실무 문서가 그렇게 한다(실측 14개 문서, 그림 43개: 개체 정렬은 전부 `LEFT`,
+/// 가운데 맞춘 그림은 문단이 가운데 — center 3 · right 2).
+///
+/// 그래서 `align` 은 실효 정렬이고, 어디서 왔는지(`alignFrom`)와 개체 원값
+/// (`objectAlign`)을 함께 낸다. 숨기면 같은 혼동이 반대 방향으로 돌아온다.
+#[test]
+fn the_reported_image_alignment_is_the_one_that_places_it() {
+    let exe = workspace_root().join("target/release/hwp");
+    if !exe.exists() {
+        eprintln!("건너뜀 — target/release/hwp 가 없다 (cargo build --release)");
+        return;
+    }
+    // **문서를 손으로 고르지 않는다.** 글자처럼 취급하는 그림이 왼쪽 아닌
+    // 문단에 올라앉은 것을 조건으로 찾는다 — 그게 이 질문이 사는 자리다.
+    let mut checked = 0usize;
+    let mut problems: Vec<String> = Vec::new();
+    for f in samples() {
+        let out = std::process::Command::new(&exe)
+            .arg("api")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                let req = serde_json::json!({"file": f, "read": ["images", "styles"]});
+                c.stdin.as_mut().expect("stdin").write_all(req.to_string().as_bytes())?;
+                c.wait_with_output()
+            })
+            .expect("api 실행");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON");
+        let styles: std::collections::HashMap<String, String> = v["styles"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|s| {
+                        (
+                            format!("{}:{}", s["section"], s["para"]),
+                            s["align"].as_str().unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for img in v["images"].as_array().cloned().unwrap_or_default() {
+            let at = img["at"].as_str().unwrap_or("").to_string();
+            let inline = img["inline"].as_bool().unwrap_or(false);
+            let align = img["align"].as_str().unwrap_or("");
+            let from = img["alignFrom"].as_str().unwrap_or("");
+            // 개체 원값은 늘 나와야 한다 — 숨기면 혼동이 반대로 돌아온다
+            assert!(
+                img.get("objectAlign").and_then(|v| v.as_str()).is_some(),
+                "{}: objectAlign 이 없다 — {img}",
+                f.display()
+            );
+            match (inline, styles.get(&at)) {
+                (true, Some(pa)) => {
+                    checked += 1;
+                    if from != "paragraph" || align != pa {
+                        problems.push(format!(
+                            "{}: 글자처럼 취급하는 그림 {at} 의 문단 정렬은 {pa:?} 인데 \
+                             align={align:?} from={from:?}",
+                            f.display()
+                        ));
+                    }
+                }
+                // 떠 있는 그림·표 칸 안의 그림은 개체가 정한다
+                _ => {
+                    if from != "object" {
+                        problems.push(format!(
+                            "{}: 글자처럼이 아닌 그림 {at} 인데 from={from:?}",
+                            f.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    assert!(
+        checked > 0,
+        "글자처럼 취급하는 그림이 본문 단락에 올라앉은 표본이 코퍼스에 없다 — \
+         실무 문서 그림 43개가 전부 그 꼴이므로, 못 덮으면 이 질문을 묻지 못한다"
+    );
+}

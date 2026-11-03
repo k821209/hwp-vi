@@ -649,6 +649,12 @@ pub struct Snapshot {
 /// 우리는 받은 바이트를 그대로 넣으므로 길이가 같으면 그 바이트다.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ImageFact {
+    /// 컨테이너 안의 부품 이름 (`BinData/image3.png`).
+    ///
+    /// 검증에 드는 이유: 우리가 넣는 그림의 이름은 **미리 세어 적는다**
+    /// (`next_bin_part`). 그러니 되읽은 이름이 그것이어야 하고, 아니면 우리가
+    /// 생각한 자리가 아닌 데 썼다는 뜻이다. 보고(`changed`)도 이 이름을 쓴다.
+    pub name: String,
     /// 문서에 **놓인** 크기 (HWPUNIT). 픽셀 크기가 아니다.
     pub placed: Option<(u32, u32)>,
     pub inline: bool,
@@ -706,6 +712,7 @@ pub fn image_facts(path: &Path) -> (BTreeMap<Coord, Vec<ImageFact>>, Vec<ImageFa
     let Ok(imgs) = crate::images::read(path) else { return (on_para, elsewhere) };
     for i in imgs {
         let fact = ImageFact {
+            name: i.name.clone(),
             placed: i.placed,
             inline: i.inline,
             align: i.align,
@@ -977,14 +984,20 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 *s = next;
             }
             Op::InsertParagraph { at } => {
-                // 좌표가 밀리므로 꾸밈 예측은 전부 버린다 — 밀린 자리를 다시
-                // 맞추는 셈을 여기 한 벌 더 적지 않는다.
+                // 좌표가 밀리므로 꾸밈 **대조**는 버린다 — 넣은 글자가 왼쪽
+                // 구간의 속성을 물려받는 셈을 여기 한 벌 더 적지 않는다.
                 cur.deco_checked.clear();
                 cur.styles_checked.clear();
                 cur.styles = shift(cur.styles, at.0, at.1, 1);
                 cur.paras = shift(cur.paras, at.0, at.1, 1);
                 cur.drawings = shift(cur.drawings, at.0, at.1, 1);
                 cur.images = shift(cur.images, at.0, at.1, 1);
+                // **표는 밀려야 한다.** 대조를 끈 것과 지도를 안 고치는 것은
+                // 다른 일이다. 안 밀어 두면 이 표가 `paras`·`styles` 와 다른
+                // 문서를 가리키게 되고, 그걸 읽는 쪽이 조용히 틀린다 —
+                // `changed` 에 서식을 실으면서 가짜 항목으로 드러났다
+                // (hwp-vi#8 을 고치다 찾았다).
+                cur.deco = shift(cur.deco, at.0, at.1, 1);
                 cur.paras.insert(*at, String::new());
             }
             Op::InsertTextInCell { table, row, col, cell_para, offset, text } => {
@@ -1041,6 +1054,7 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 }
                 let slot = cur.images.entry(*at).or_default();
                 slot.push(ImageFact {
+                    name: part.clone(),
                     placed: Some((*width, *height)),
                     inline: *inline,
                     align: *align,
@@ -1196,6 +1210,8 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 cur.paras = shift(cur.paras, at.0, at.1, 1);
                 cur.drawings = shift(cur.drawings, at.0, at.1, 1);
                 cur.images = shift(cur.images, at.0, at.1, 1);
+                cur.deco = shift(cur.deco, at.0, at.1, 1);
+                cur.styles = shift(cur.styles, at.0, at.1, 1);
                 cur.paras.insert(*at, String::new());
                 // 그 단락이 표를 든다
                 cur.drawings.insert(*at, 1);
@@ -1247,6 +1263,10 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 cur.drawings = shift(cur.drawings, at.0, at.1, -1);
                 cur.images.remove(at);
                 cur.images = shift(cur.images, at.0, at.1, -1);
+                cur.deco.remove(at);
+                cur.deco = shift(cur.deco, at.0, at.1, -1);
+                cur.styles.remove(at);
+                cur.styles = shift(cur.styles, at.0, at.1, -1);
             }
         }
     }
@@ -1415,7 +1435,8 @@ fn diff_report(
             let say = |f: &ImageFact| {
                 let (x, y) = f.placed.unwrap_or((0, 0));
                 format!(
-                    "{:.1}×{:.1}pt · {} · {:?} · {}B",
+                    "{} {:.1}×{:.1}pt · {} · {:?} · {}B",
+                    f.name,
                     x as f64 / 100.0,
                     y as f64 / 100.0,
                     if f.inline { "글자처럼" } else { "따로" },
