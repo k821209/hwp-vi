@@ -979,7 +979,7 @@ pub fn run(req: Request) -> Result<Value> {
         }
         let pin = Pin::load_default()?;
         let rhwp = Rhwp::discover(&pin)?;
-        let report = hwp_core::create::create(&rhwp, spec, &dest)?;
+        let report = hwp_core::create::create(&rhwp, spec, &dest, req.overwrite)?;
         out.insert("output".into(), json!(dest.display().to_string()));
         out.insert(
             "created".into(),
@@ -991,6 +991,13 @@ pub fn run(req: Request) -> Result<Value> {
                 "verifiedBy": "witness",
             }),
         );
+        // **만들어졌지만 적용되지 않은 것은 말한다.** 비어 있으면 칸을 내지
+        // 않는다 — 조용히 넘기는 것이 이 저장소가 가장 경계하는 꼴이고
+        // (hwp-vi#7·#9 가 둘 다 그 모양이었다), 보이지 않는 경고는 없는
+        // 경고와 같다.
+        if !report.warnings.is_empty() {
+            out.insert("warnings".into(), json!(report.warnings));
+        }
         // 만든 문서의 본문은 **우리가 쓴 것**이므로 신뢰할 수 없는 입력이
         // 아니다 — 그래도 받는 쪽이 분기를 단순하게 쓸 수 있게 표지를 붙인다.
         out.insert("untrusted".into(), json!(false));
@@ -2056,7 +2063,11 @@ fn lower(
             }];
             let mut extra = String::new();
             if let Some(a) = want {
-                if inline && a != Align::Left {
+                // **`left` 도 쓴다.** 전에는 `Left` 면 문단을 건드리지 않았는데,
+                // 그러면 `align:"left"` 를 준 뒤 되읽으면 문단 기본값인
+                // `justify` 가 나와 왕복 대조가 깨진다(hwp-vi#11). 한글에
+                // 왼쪽과 양쪽맞춤은 다른 값이므로 말한 대로 적는다.
+                if inline {
                     use hwp_core::witness::ParaAlign;
                     let pa = match a {
                         Align::Center => ParaAlign::Center,
@@ -2079,8 +2090,6 @@ fn lower(
                         pa.label(),
                         if has_text { " — 이 단락의 글자도 같이 정렬된다" } else { "" }
                     );
-                } else if inline {
-                    extra = ", 정렬 left 는 문단을 건드리지 않는다".to_string();
                 } else {
                     extra = format!(", 개체 정렬 {a:?} (떠 있는 그림)");
                 }

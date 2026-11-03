@@ -56,6 +56,11 @@ pub struct CreateReport {
     pub tables: usize,
     /// 증인이 센 표 칸 수
     pub cells: usize,
+    /// **만들어졌지만 요청의 일부가 적용되지 않은 것.** 비어 있는 것이 정상이다.
+    ///
+    /// 조용히 넘기지 않기 위해 있다 — 받고 무시하는 것이 이 저장소가 가장
+    /// 경계하는 꼴이다(사용자 보고 hwp-vi#7·#9 가 둘 다 그 모양이었다).
+    pub warnings: Vec<String>,
 }
 
 /// 명세에서 뽑은 "이렇게 되어야 한다".
@@ -89,7 +94,13 @@ struct WantedImage {
     width: u32,
     height: u32,
     inline: bool,
-    align: crate::images::Align,
+    /// **명세가 정렬을 말했는가.** `None` 이면 문단을 건드리지 않는다.
+    ///
+    /// 전에는 `Align::Left` 를 기본값으로 뒀는데, 그러면 `align:"left"` 를
+    /// 준 것과 안 준 것이 같아진다 — 그래서 `left` 를 줘도 문단이 그대로
+    /// 남고 되읽으면 `justify` 가 나왔다(사용자 보고 hwp-vi#11). 넣은 값과
+    /// 돌아온 값이 다르면 왕복 대조가 깨진다.
+    align: Option<crate::images::Align>,
     /// 사람에게 보여 줄 원래 경로
     path: String,
 }
@@ -293,9 +304,10 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
                 }
                 let inline = b.get("inline").and_then(|v| v.as_bool()).unwrap_or(true);
                 let align = match b.get("align").and_then(|v| v.as_str()).map(str::trim) {
-                    None | Some("left") => crate::images::Align::Left,
-                    Some("center") => crate::images::Align::Center,
-                    Some("right") => crate::images::Align::Right,
+                    None => None,
+                    Some("left") => Some(crate::images::Align::Left),
+                    Some("center") => Some(crate::images::Align::Center),
+                    Some("right") => Some(crate::images::Align::Right),
                     Some(other) => bail!(
                         "blocks[{i}] (image) 의 `align` 이 `{other}` 입니다 \
                          (받는 것: left|center|right)"
@@ -350,7 +362,7 @@ pub fn plan(rhwp: &Rhwp, spec: &Value) -> Result<Value> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("{} 를 만들 수 없습니다", dir.display()))?;
     let probe = dir.join("probe.hwpx");
-    let report = create(rhwp, spec, &probe);
+    let report = create(rhwp, spec, &probe, false);
     let _ = std::fs::remove_dir_all(&dir);
     let report = report?;
 
@@ -372,9 +384,23 @@ pub fn plan(rhwp: &Rhwp, spec: &Value) -> Result<Value> {
 /// 명세에서 문서를 만든다. **목적지가 이미 있으면 만들지 않는다.**
 ///
 /// 덮어도 된다는 판단은 부르는 쪽이 한다 — 이 함수는 없는 자리에만 쓴다.
-pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
-    if dest.exists() {
-        bail!("{} 이 이미 있습니다 — 다른 이름을 주세요", dest.display());
+/// `overwrite` 는 **있는 파일을 덮어도 되는가.**
+///
+/// 사용자 보고(hwp-vi#9): 요청이 `overwrite` 를 받는데 `create` 가 무시했다.
+/// 편집 경로(`file` + `ops` + `output`)에서는 듣고 여기서는 안 들었으니,
+/// **같은 이름의 칸이 경로에 따라 듣기도 하고 안 듣기도 했다.** "원고를 고치고
+/// 다시 뽑는 것이 기본 흐름" 인데 두 번째부터 사람이 손으로 지워야 했다.
+///
+/// 덮을 때도 옛 바이트를 **`.bak` 으로 남긴다.** 만들기는 임시본을 만들어
+/// 증인이 대조한 뒤에야 `rename` 하므로 깨진 파일로 덮을 일은 없지만,
+/// "덮어도 된다" 가 "옛 것을 버려도 된다" 는 아니다 — 저장 경로가 같은 자리에서
+/// 같은 판단을 한다.
+pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result<CreateReport> {
+    if dest.exists() && !overwrite {
+        bail!(
+            "{} 이 이미 있습니다 — 덮으려면 `\"overwrite\": true` 를 함께 보내세요",
+            dest.display()
+        );
     }
     // HWPX 만 만들 수 있다 — 백엔드의 `scaffold` 가 그것만 낸다. 확장자가
     // `.hwp` 면 사용자는 HWP5 를 기대하므로, 조용히 다른 것을 주지 않는다.
@@ -503,11 +529,19 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
                 // 글자처럼 취급하는 그림의 정렬은 **문단**이 한다(실측: 실무
                 // 문서 14개의 그림 43개가 전부 개체 정렬 Left, 가운데 맞춘
                 // 그림은 문단이 가운데). 떠 있는 그림만 개체에 적는다.
-                if im.inline { crate::images::Align::Left } else { im.align },
+                if im.inline {
+                    crate::images::Align::Left
+                } else {
+                    im.align.unwrap_or(crate::images::Align::Left)
+                },
             )
             .with_context(|| format!("그림 {n} ({}) 을 넣을 수 없습니다", im.path))?;
-            if im.inline && im.align != crate::images::Align::Left {
-                let owpml = match im.align {
+            // **`left` 도 쓴다.** 전에는 `Left` 를 건너뛰었는데, 그러면
+            // `align:"left"` 를 준 문서를 되읽으면 문단 기본값인 `justify` 가
+            // 나와 왕복 대조가 깨진다(hwp-vi#11). 한글에는 왼쪽과 양쪽맞춤이
+            // 다른 값으로 있으므로, 말한 대로 왼쪽을 적는다.
+            if let (true, Some(a)) = (im.inline, im.align) {
+                let owpml = match a {
                     crate::images::Align::Center => "CENTER",
                     crate::images::Align::Right => "RIGHT",
                     crate::images::Align::Left => "LEFT",
@@ -524,21 +558,59 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
             .with_context(|| format!("{} 를 다시 묶을 수 없습니다", tmp.display()))?;
     }
 
+    let mut warnings: Vec<String> = Vec::new();
+    // **글자 크기를 정말 적었는가.** 적지 않았으면(걸 자리가 없어서) 아래
+    // 검증이 그 값을 찾으면 안 된다 — 쓰기 쪽은 경고를 냈는데 검증 쪽이
+    // 그걸 모르고 값을 요구해서, 제목만·그림만 있는 문서가 거부당했다.
+    let mut size_applied = false;
     if want.font_size_100pt.is_some() || want.margins.is_some() {
         let mut pkg = crate::hwpx::Package::open(&tmp)
             .with_context(|| format!("{} 를 풀 수 없습니다", tmp.display()))?;
         if let Some(h) = want.font_size_100pt {
-            // 글자로 찾는다 — "charPr 0 이 본문" 을 박지 않는다
-            let ids = crate::hwpx::char_pr_ids_for(&pkg, &want.body_lines);
-            if ids.is_empty() {
-                bail!(
-                    "`font_size_pt` 를 걸 자리를 찾지 못했습니다 — 본문(`paragraph`) \
-                     블록이 있어야 합니다"
-                );
+            // **글자로 찾는다** — "charPr 0 이 본문" 을 박지 않는다.
+            //
+            // 찾는 범위에 **표 칸을 넣는다.** 전에는 본문 문단만 봤는데,
+            // 그러면 표만·제목만 있는 문서가 규격을 못 걸었다(사용자 보고
+            // hwp-vi#10: "규격이 정해진 문서일수록 본문 없는 쪽이 함께
+            // 나온다 — 표지, 도판 쪽, 부록").
+            //
+            // 넣어도 되는 근거는 실측이다. 표만 있는 문서를 만들어 보니
+            // 칸 4개가 **본문 문단이 쓰는 그 `charPr`**(id 0, height 1000)을
+            // 썼다. 제목(1800)과 글머리(1200)는 자기 것을 따로 쓰므로
+            // 함께 바뀌지 않는다 — 사용자가 바란 그 구분이다.
+            let mut texts = want.body_lines.clone();
+            for grid in &want.tables {
+                for row in grid {
+                    for cell in row {
+                        if !cell.trim().is_empty() {
+                            texts.push(cell.clone());
+                        }
+                    }
+                }
             }
-            let n = crate::hwpx::set_char_height(&mut pkg, &ids, h)?;
-            if n == 0 {
-                bail!("글자 크기를 적지 못했습니다 (charPr {ids:?})");
+            let ids = crate::hwpx::char_pr_ids_for(&pkg, &texts);
+            if ids.is_empty() {
+                // **글자가 아예 없으면 걸 자리가 없다.** 거부하지 않는다 —
+                // 그림 한 장만 있는 도판 쪽도 만들어져야 한다. 대신
+                // **적용되지 않았다고 말한다.** 조용히 넘기면 받는 쪽은
+                // 규격이 걸린 줄 안다.
+                // 제목과 글머리는 **자기 `charPr` 을 따로 쓴다**(실측: 제목
+                // 1800, 글머리 1200, 본문·표칸 1000). 사용자가 바란 구분이
+                // 그것이므로 함께 바꾸지 않는다 — 그래서 본문도 표도 없는
+                // 문서에는 걸 자리가 없다. 거부하지 않고 **말한다.**
+                warnings.push(format!(
+                    "`font_size_pt` ({:.1}pt) 를 걸 자리가 없습니다 — 이 문서에는 \
+                     본문도 표 칸도 없습니다(제목·글머리·그림만). 제목과 글머리는 \
+                     자기 글자 크기를 따로 가지므로 함께 바꾸지 않습니다. 문서는 \
+                     만들어졌고 글자 크기만 적용되지 않았습니다.",
+                    h as f64 / 100.0
+                ));
+            } else {
+                let n = crate::hwpx::set_char_height(&mut pkg, &ids, h)?;
+                if n == 0 {
+                    bail!("글자 크기를 적지 못했습니다 (charPr {ids:?})");
+                }
+                size_applied = true;
             }
         }
         if let Some(m) = want.margins {
@@ -686,7 +758,7 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
     // 이게 "읽을 수 있는 것만 쓴다" 의 값이다. 증인이 글자 크기와 쪽 설정을
     // 읽으므로, 우리가 XML 에 적은 수가 실제로 들어갔는지 확인할 수 있다 —
     // 확인할 수 없으면 적지 않는다.
-    if let Some(want_h) = want.font_size_100pt {
+    if let Some(want_h) = want.font_size_100pt.filter(|_| size_applied) {
         // 본문 글줄이 그 크기로 되읽히는가
         let mut seen = 0usize;
         for line in &want.body_lines {
@@ -708,7 +780,50 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
             }
         }
         if seen == 0 {
-            diffs.push("본문 글줄을 되읽지 못해 글자 크기를 확인할 수 없습니다".into());
+            // **증인으로 확인할 수 없는 경우** — 표만·제목만 있는 문서다.
+            //
+            // 전에는 여기서 만들기를 멈췄다(사용자 보고 hwp-vi#10: "규격이
+            // 정해진 문서일수록 본문 없는 쪽이 함께 나온다 — 표지, 도판 쪽,
+            // 부록"). 그런데 멈출 이유가 약하다: 실측으로 표 칸은 본문 문단이
+            // 쓰는 그 `charPr`(id 0)을 쓰므로 크기는 **실제로 들어간다**.
+            //
+            // 증인이 확인하지 못하는 이유는 `WitnessCell` 에 구간(`runs`)이
+            // 없어서다 — 칸의 글자는 읽지만 그 글자의 크기는 안 읽는다.
+            // 그래서 **약한 확인**으로 내려간다: 우리가 적은 `charPr/@height`
+            // 를 다시 열어 읽는다. 우리가 쓴 것을 우리가 읽는 것이므로 독립
+            // 증인이 아니다 — 그 차이를 숨기지 않고 `warnings` 에 적는다.
+            let mut wrote: Vec<u32> = Vec::new();
+            if let Ok(pkg) = crate::hwpx::Package::open(&tmp) {
+                if let Some(hdr) = pkg.text("Contents/header.xml") {
+                    let mut rest = hdr.as_str();
+                    while let Some(at) = rest.find("height=\"") {
+                        let s0 = at + "height=\"".len();
+                        if let Some(e0) = rest[s0..].find('"') {
+                            if let Ok(v) = rest[s0..s0 + e0].parse::<u32>() {
+                                wrote.push(v);
+                            }
+                        }
+                        rest = &rest[s0..];
+                    }
+                }
+            }
+            if wrote.contains(&want_h) {
+                warnings.push(format!(
+                    "글자 크기 {:.1}pt 는 적었지만 **독립 증인으로 확인하지 못했습니다** — \
+                     이 문서에는 본문 문단이 없고(표·제목·그림만), 증인은 표 칸의 \
+                     글자 크기를 읽지 않습니다. 적힌 것은 `charPr` 을 다시 열어 \
+                     확인했습니다(우리가 쓴 것을 우리가 읽은 것이므로 평소보다 \
+                     약한 확인입니다). 한글에서 한 번 열어 보시기를 권합니다.",
+                    want_h as f64 / 100.0
+                ));
+            } else {
+                diffs.push(format!(
+                    "글자 크기 {:.1}pt 를 적지 못했습니다 — `charPr` 에 그 값이 \
+                     없습니다 (읽힌 값: {:?})",
+                    want_h as f64 / 100.0,
+                    wrote
+                ));
+            }
         }
     }
     if let Some(m) = want.margins {
@@ -747,6 +862,18 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
     }
 
     let cells: usize = grids.iter().map(|g| g.iter().map(|r| r.len()).sum::<usize>()).sum();
+    // **덮기 전에 옛 것을 비켜 둔다.** `backup_path` 는 이미 있는 `.bak` 을
+    // 덮지 않고 세대를 남긴다 — 두 번 고친 문서의 원본이 영구히 사라진 적이
+    // 있어서 그렇게 되어 있다.
+    let backup = if dest.exists() {
+        let b = crate::edit::backup_path(dest);
+        std::fs::rename(dest, &b)
+            .with_context(|| format!("{} 를 {} 로 비켜 둘 수 없습니다", dest.display(), b.display()))?;
+        Some(b)
+    } else {
+        None
+    };
+    let _ = &backup;
     std::fs::rename(&tmp, dest)
         .with_context(|| format!("{} 로 들여놓을 수 없습니다", dest.display()))?;
     std::mem::forget(_tmp_guard);
@@ -757,6 +884,7 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
         paragraphs: body.len(),
         tables: grids.len(),
         cells,
+        warnings,
     })
 }
 

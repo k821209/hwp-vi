@@ -3469,7 +3469,7 @@ fn creating_a_document_from_a_spec_is_verified_by_the_witness() {
         ]
     });
 
-    let report = hwp_core::create::create(&rhwp, &spec, &dest).expect("만들기");
+    let report = hwp_core::create::create(&rhwp, &spec, &dest, false).expect("만들기");
     assert_eq!(report.blocks, 4);
     assert_eq!(report.tables, 1, "표 1개여야 한다");
     assert_eq!(report.cells, 4, "2×2 = 4칸이어야 한다");
@@ -3489,12 +3489,12 @@ fn creating_a_document_from_a_spec_is_verified_by_the_witness() {
     assert_eq!(doc.tables.len(), 1, "표가 좌표와 함께 있어야 한다");
 
     // **있는 파일은 만들지 않는다.**
-    let again = hwp_core::create::create(&rhwp, &spec, &dest);
+    let again = hwp_core::create::create(&rhwp, &spec, &dest, false);
     assert!(again.is_err(), "있는 파일을 덮었다");
     assert!(format!("{}", again.unwrap_err()).contains("이미 있"));
 
     // **`.hwp` 는 만들 수 없다고 말한다** — 조용히 다른 형식을 주지 않는다.
-    let wrong = hwp_core::create::create(&rhwp, &spec, &dir.join("x.hwp"));
+    let wrong = hwp_core::create::create(&rhwp, &spec, &dir.join("x.hwp"), false);
     let m = format!("{}", wrong.unwrap_err());
     assert!(m.contains("hwpx"), "무엇만 되는지 말해야 한다: {m}");
 
@@ -4394,7 +4394,7 @@ fn a_document_made_to_a_spec_has_the_typography_it_asked_for() {
         ]
     });
 
-    hwp_core::create::create(&rhwp, &spec, &dest)
+    hwp_core::create::create(&rhwp, &spec, &dest, false)
         .unwrap_or_else(|e| panic!("규격 문서 만들기: {e:#}"));
 
     // ---- 증인으로 되읽는다
@@ -4456,7 +4456,7 @@ fn a_document_made_to_a_spec_has_the_typography_it_asked_for() {
         "version": "1", "title": "t", "font_size_pt": 999,
         "blocks": [{"type": "paragraph", "text": "가"}]
     });
-    let e = hwp_core::create::create(&rhwp, &bad, &dir.join("bad.hwpx"))
+    let e = hwp_core::create::create(&rhwp, &bad, &dir.join("bad.hwpx"), false)
         .expect_err("999pt 는 거부해야 한다");
     assert!(format!("{e:#}").contains("200"), "{e:#}");
 
@@ -4464,7 +4464,7 @@ fn a_document_made_to_a_spec_has_the_typography_it_asked_for() {
         "version": "1", "title": "t", "margins_mm": {"middle": 10},
         "blocks": [{"type": "paragraph", "text": "가"}]
     });
-    let e2 = hwp_core::create::create(&rhwp, &bad2, &dir.join("bad2.hwpx"))
+    let e2 = hwp_core::create::create(&rhwp, &bad2, &dir.join("bad2.hwpx"), false)
         .expect_err("모르는 여백 이름은 거부해야 한다");
     assert!(format!("{e2:#}").contains("middle"), "{e2:#}");
 
@@ -5045,7 +5045,7 @@ fn a_spec_with_an_image_block_produces_a_document_with_that_image() {
             {"type": "paragraph", "text": "그림 1. 흐름도"},
         ],
     });
-    let report = hwp_core::create::create(&rhwp, &spec, &out)
+    let report = hwp_core::create::create(&rhwp, &spec, &out, false)
         .unwrap_or_else(|e| panic!("만들기: {e:#}"));
     assert_eq!(report.path, out);
 
@@ -5568,6 +5568,222 @@ fn changing_one_paragraphs_char_size_does_not_spread_to_others() {
     let back = dir.join("back.hwp");
     rhwp.run(&["convert", &doc.to_string_lossy(), &back.to_string_lossy(), "--verify"])
         .unwrap_or_else(|e| panic!("백엔드가 우리가 쓴 글자 크기를 거부했다: {e:#}"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **`overwrite` 는 만들기에서도 들어야 한다** — hwp-vi#9.
+///
+/// 요청이 받는 칸이 **경로에 따라 듣기도 하고 안 듣기도 했다**: 편집
+/// (`file`+`ops`+`output`)에서는 들었고 만들기에서는 무시됐다. "원고를 고치고
+/// 다시 뽑는 것이 기본 흐름" 인데 두 번째부터 사람이 손으로 지워야 했다.
+///
+/// 덮을 때도 옛 바이트를 `.bak` 으로 남긴다 — "덮어도 된다" 가 "옛 것을
+/// 버려도 된다" 는 아니다.
+#[test]
+fn creating_over_an_existing_file_needs_overwrite_and_keeps_a_backup() {
+    let Some((rhwp, _)) = backend() else { return };
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-ov-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+    let dest = dir.join("ov.hwpx");
+
+    let spec = |text: &str| {
+        serde_json::json!({
+            "version": "1", "title": "덮어쓰기 시험",
+            "blocks": [{"type": "paragraph", "text": text}],
+        })
+    };
+
+    hwp_core::create::create(&rhwp, &spec("첫 번째"), &dest, false).expect("처음 만들기");
+
+    // **`overwrite` 없이는 거부하고, 무엇을 보내야 하는지 말한다.**
+    let e = hwp_core::create::create(&rhwp, &spec("두 번째"), &dest, false)
+        .expect_err("있는 파일을 덮어서는 안 된다");
+    let m = format!("{e}");
+    assert!(m.contains("overwrite"), "보낼 칸을 말하지 않는다: {m}");
+    // 거부했으니 내용은 1회차 그대로
+    let t = Testimony::read(&dest).expect("증인");
+    let body: Vec<String> = t
+        .body_paragraphs()
+        .iter()
+        .map(|p| hwp_core::offset::visible(&p.text).trim().to_string())
+        .collect();
+    assert!(body.iter().any(|b| b == "첫 번째"), "거부했는데 내용이 바뀌었다: {body:?}");
+
+    // **`overwrite: true` 면 덮고, 옛 것은 `.bak` 으로 남는다.**
+    hwp_core::create::create(&rhwp, &spec("두 번째"), &dest, true).expect("덮어쓰기");
+    let t2 = Testimony::read(&dest).expect("증인");
+    let body2: Vec<String> = t2
+        .body_paragraphs()
+        .iter()
+        .map(|p| hwp_core::offset::visible(&p.text).trim().to_string())
+        .collect();
+    assert!(body2.iter().any(|b| b == "두 번째"), "덮이지 않았다: {body2:?}");
+    assert!(
+        !body2.iter().any(|b| b == "첫 번째"),
+        "1회차 내용이 남아 있다: {body2:?}"
+    );
+
+    let bak = dir.join("ov.hwpx.bak");
+    assert!(bak.is_file(), "옛 바이트를 `.bak` 으로 남기지 않았다");
+    let old = Testimony::read(&bak).expect("`.bak` 도 읽혀야 한다");
+    let oldbody: Vec<String> = old
+        .body_paragraphs()
+        .iter()
+        .map(|p| hwp_core::offset::visible(&p.text).trim().to_string())
+        .collect();
+    assert!(
+        oldbody.iter().any(|b| b == "첫 번째"),
+        "`.bak` 이 옛 문서가 아니다: {oldbody:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **본문 문단이 없는 문서도 규격을 건다** — hwp-vi#10.
+///
+/// 전에는 `font_size_pt` 를 주면 `paragraph` 블록이 하나라도 있어야 했다.
+/// "규격이 정해진 문서일수록 본문 없는 쪽이 함께 나온다 — 표지, 그림 한 장만
+/// 있는 도판 쪽, 표만 들어가는 부록"(사용자 보고).
+///
+/// 실측으로 자리를 정했다: 표만 있는 문서의 칸 4개가 **본문 문단이 쓰는 그
+/// `charPr`**(id 0, height 1000)을 쓴다. 제목(1800)과 글머리(1200)는 자기 것을
+/// 따로 쓰므로 함께 바뀌지 않는다 — 사용자가 바란 그 구분이다.
+///
+/// 걸 자리가 아예 없으면(제목만·그림만) **거부하지 않고 말한다.** 받고 조용히
+/// 무시하는 것이 이 저장소가 가장 경계하는 꼴이다.
+#[test]
+fn a_document_with_no_body_paragraph_still_takes_a_font_size() {
+    let Some((rhwp, _)) = backend() else { return };
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-nb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+
+    // ---- 표만: 칸이 그 크기가 되어야 한다
+    let out = dir.join("table.hwpx");
+    let spec = serde_json::json!({
+        "version": "1", "title": "부록",
+        "font_size_pt": 13,
+        "blocks": [{"type": "table", "rows": [["가", "나"], ["다", "라"]]}],
+    });
+    let r = hwp_core::create::create(&rhwp, &spec, &out, false)
+        .unwrap_or_else(|e| panic!("표만 있는 문서: {e:#}"));
+    assert_eq!(r.cells, 4, "칸이 넷이어야 한다");
+    // 증인은 칸의 **구간**을 읽지 않으므로(= 칸 글자의 크기를 모른다) 여기서는
+    // 그 한계를 말했는지를 본다. 이것이 이 설계의 값이다.
+    assert!(
+        r.warnings.iter().any(|w| w.contains("증인")),
+        "증인으로 확인하지 못한 것을 말하지 않았다: {:?}",
+        r.warnings
+    );
+    // 그리고 **실제로 적혔는지**는 컨테이너에서 센다
+    let pkg = hwp_core::hwpx::Package::open(&out).expect("풀기");
+    let hdr = pkg.text("Contents/header.xml").expect("header");
+    assert!(
+        hdr.contains("height=\"1300\""),
+        "`charPr` 에 13pt 가 없다"
+    );
+    // 제목은 자기 크기를 지켜야 한다 — 함께 바뀌면 사용자가 바란 구분이 깨진다
+    assert!(
+        hdr.contains("height=\"1800\""),
+        "제목 크기(18pt)가 함께 바뀌었다"
+    );
+
+    // ---- 제목만: 걸 자리가 없고, **거부하지 않고 말한다**
+    let out2 = dir.join("head.hwpx");
+    let spec2 = serde_json::json!({
+        "version": "1", "title": "표지",
+        "font_size_pt": 13,
+        "blocks": [{"type": "heading", "level": 1, "text": "표지입니다"}],
+    });
+    let r2 = hwp_core::create::create(&rhwp, &spec2, &out2, false)
+        .unwrap_or_else(|e| panic!("제목만 있는 문서가 거부됐다: {e:#}"));
+    assert!(out2.is_file(), "문서가 만들어져야 한다");
+    assert!(
+        r2.warnings.iter().any(|w| w.contains("걸 자리가 없습니다")),
+        "적용되지 않은 것을 말하지 않았다: {:?}",
+        r2.warnings
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **그림의 `align:"left"` 가 왕복해야 한다** — hwp-vi#11.
+///
+/// `left` 를 "문단을 건드리지 않음" 으로 특별 취급했더니, 되읽으면 문단
+/// 기본값인 `justify` 가 나왔다. **넣은 값과 돌아온 값이 다르면 왕복 대조가
+/// 깨진다** — 생성한 문서를 되읽어 기대값과 맞추는 쪽에서 한 건이 어긋난
+/// 것으로 보고된다.
+///
+/// 한글에 왼쪽과 양쪽맞춤은 **다른 값으로** 있으므로 말한 대로 적는다.
+/// 반대로 `align` 을 **안 주면** 문단 기본값이 그대로 남아야 한다 — 그 둘이
+/// 구별되는 것이 이 수정의 본체다.
+#[test]
+fn an_images_requested_alignment_round_trips_including_left() {
+    let Some((rhwp, _)) = backend() else { return };
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-rt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+    let png = dir.join("fig.png");
+    image::RgbImage::from_fn(8, 4, |x, _| image::Rgb([(x * 30) as u8, 60, 200]))
+        .save(&png)
+        .expect("PNG");
+
+    let read_align = |p: &std::path::Path| -> Vec<String> {
+        let imgs = hwp_core::images::read(p).expect("그림 읽기");
+        let t = Testimony::read(p).expect("증인");
+        imgs.iter()
+            .map(|i| {
+                // 글자처럼 취급하는 그림의 가로 자리는 **문단**이 정한다
+                match i.at.filter(|_| i.inline).and_then(|at| {
+                    t.body_paragraphs()
+                        .into_iter()
+                        .find(|p| (p.section, p.index.unwrap_or(u32::MAX)) == at)
+                        .map(|p| format!("{:?}", p.style.align).to_lowercase())
+                }) {
+                    Some(a) => a,
+                    None => format!("{:?}", i.align).to_lowercase(),
+                }
+            })
+            .collect()
+    };
+
+    for want in ["left", "center", "right"] {
+        let out = dir.join(format!("{want}.hwpx"));
+        let spec = serde_json::json!({
+            "version": "1", "title": "왕복",
+            "blocks": [
+                {"type": "paragraph", "text": "그림 설명"},
+                {"type": "image", "path": png.to_string_lossy(),
+                 "widthMm": 80, "align": want},
+            ],
+        });
+        hwp_core::create::create(&rhwp, &spec, &out, false)
+            .unwrap_or_else(|e| panic!("align={want}: {e:#}"));
+        assert_eq!(
+            read_align(&out),
+            vec![want.to_string()],
+            "align={want} 를 줬는데 다른 값이 돌아왔다"
+        );
+    }
+
+    // **안 주면 문단 기본값이 남는다** — 준 것과 안 준 것이 구별되어야 한다
+    let out = dir.join("none.hwpx");
+    let spec = serde_json::json!({
+        "version": "1", "title": "왕복",
+        "blocks": [
+            {"type": "paragraph", "text": "그림 설명"},
+            {"type": "image", "path": png.to_string_lossy(), "widthMm": 80},
+        ],
+    });
+    hwp_core::create::create(&rhwp, &spec, &out, false).expect("align 없이");
+    let got = read_align(&out);
+    assert_ne!(
+        got,
+        vec!["left".to_string()],
+        "`align` 을 안 줬는데 왼쪽이 걸렸다 — 준 것과 안 준 것이 같아졌다"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
