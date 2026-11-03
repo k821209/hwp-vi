@@ -72,6 +72,26 @@ struct Wanted {
     font_size_100pt: Option<u32>,
     /// 여백, HWPUNIT. 명세의 `margins_mm` 에서.
     margins: Option<Margins>,
+    /// 그림 블록들. 백엔드의 `scaffold` 는 그림을 모르므로, 그 자리에
+    /// **표지 글자**가 든 단락을 만들게 하고 만든 뒤 우리가 그림을 넣는다.
+    images: Vec<WantedImage>,
+}
+
+/// 명세의 `{"type":"image", …}` 하나.
+#[derive(Debug, Clone)]
+struct WantedImage {
+    /// 백엔드가 만들 단락을 되찾는 **표지 글자**. 실무 글에 나올 수 없는
+    /// 모양이어야 하고, 그림을 넣은 뒤 지운다.
+    marker: String,
+    bytes: Vec<u8>,
+    ext: String,
+    /// 1/100 pt
+    width: u32,
+    height: u32,
+    inline: bool,
+    align: crate::images::Align,
+    /// 사람에게 보여 줄 원래 경로
+    path: String,
 }
 
 /// 여백 — HWPUNIT.
@@ -81,6 +101,21 @@ struct Margins {
     right: Option<u32>,
     top: Option<u32>,
     bottom: Option<u32>,
+}
+
+/// 그림 블록이 앉을 단락을 되찾기 위한 **표지 글자**.
+///
+/// 백엔드의 `scaffold` 는 그림을 모른다. 그래서 그 자리에 이 글자가 든 단락을
+/// 만들게 하고, 만든 뒤 증인으로 그 단락을 **글자로** 찾아 그림을 넣고 표지를
+/// **보이는 글자다.** 안 보이는 표지(U+2063 같은 것)를 쓰면 지우기가 실패했을
+/// 때 문서에 조용히 남는다 — 눈에 띄는 쪽이 낫고, 검증에서도 남았는지 본다.
+///
+/// 단락 번호를 미리 세지 않는 이유: 제목 단락과 표 앵커 단락이 몇 개
+/// 더 생기는지는 백엔드가 정하고, 그 셈을 우리가 재현하면 백엔드가 바뀔 때
+/// 조용히 틀린다 — 글자로 찾으면 그 가정이 필요 없다(`char_pr_ids_for` 가
+/// 글자로 찾는 것과 같은 이유다).
+fn image_marker(n: usize) -> String {
+    format!("[[hwp-vi:image:{n}]]")
 }
 
 fn wanted_from(spec: &Value) -> Result<Wanted> {
@@ -149,6 +184,7 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
     let mut lines = Vec::new();
     let mut body_lines = Vec::new();
     let mut tables = Vec::new();
+    let mut images: Vec<WantedImage> = Vec::new();
     for (i, b) in blocks.iter().enumerate() {
         let kind = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match kind {
@@ -191,12 +227,98 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
                 }
                 tables.push(grid);
             }
+            "image" => {
+                let path = b.get("path").and_then(|t| t.as_str()).ok_or_else(|| {
+                    anyhow::anyhow!("blocks[{i}] (image) 에 `path` 가 없습니다")
+                })?;
+                let src = Path::new(path);
+                let bytes = std::fs::read(src).map_err(|e| {
+                    anyhow::anyhow!("blocks[{i}] (image) 의 그림을 읽을 수 없습니다: {path} ({e})")
+                })?;
+                if bytes.is_empty() {
+                    bail!("blocks[{i}] (image) 의 {path} 가 0바이트입니다");
+                }
+                let ext = src
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "gif" | "tif" | "tiff") {
+                    bail!(
+                        "blocks[{i}] (image) 의 그림 형식을 모릅니다: {path} \
+                         (받는 것: png·jpg·bmp·gif·tif)"
+                    );
+                }
+                // **한 변만 주면 나머지는 그림 비율에서 온다** — 양쪽을 다
+                // 받으라고 하면 찌그러진 그림이 가장 흔한 실수가 된다.
+                // `insert-image` 와 같은 셈이다.
+                let mm = |k: &str| -> Result<Option<f64>> {
+                    match b.get(k) {
+                        None | Some(Value::Null) => Ok(None),
+                        Some(v) => v
+                            .as_f64()
+                            .filter(|x| *x > 0.0)
+                            .map(Some)
+                            .ok_or_else(|| anyhow::anyhow!(
+                                "blocks[{i}] (image) 의 `{k}` 가 양수가 아닙니다: {v}"
+                            )),
+                    }
+                };
+                let to100 = |x: f64| (x * 72.0 / 25.4 * 100.0).round() as u32;
+                let px = crate::images::pixel_size(&bytes);
+                let (width, height) = match (mm("widthMm")?, mm("heightMm")?) {
+                    (Some(a), Some(c)) => (to100(a), to100(c)),
+                    (Some(a), None) => {
+                        let (pw, ph) = px.ok_or_else(|| anyhow::anyhow!(
+                            "blocks[{i}] (image) 의 픽셀 크기를 읽을 수 없어 `heightMm` 를 \
+                             비율로 채울 수 없습니다 — 두 변을 다 주세요"
+                        ))?;
+                        let w = to100(a);
+                        (w, ((w as f64) * ph as f64 / pw as f64).round() as u32)
+                    }
+                    (None, Some(c)) => {
+                        let (pw, ph) = px.ok_or_else(|| anyhow::anyhow!(
+                            "blocks[{i}] (image) 의 픽셀 크기를 읽을 수 없어 `widthMm` 를 \
+                             비율로 채울 수 없습니다 — 두 변을 다 주세요"
+                        ))?;
+                        let h = to100(c);
+                        (((h as f64) * pw as f64 / ph as f64).round() as u32, h)
+                    }
+                    (None, None) => bail!(
+                        "blocks[{i}] (image) 에 크기가 없습니다 — `widthMm` 이나 `heightMm` \
+                         중 하나만 주면 나머지는 그림 비율에서 옵니다"
+                    ),
+                };
+                if width == 0 || height == 0 {
+                    bail!("blocks[{i}] (image) 의 크기가 0 으로 계산됐습니다 ({width}×{height})");
+                }
+                let inline = b.get("inline").and_then(|v| v.as_bool()).unwrap_or(true);
+                let align = match b.get("align").and_then(|v| v.as_str()).map(str::trim) {
+                    None | Some("left") => crate::images::Align::Left,
+                    Some("center") => crate::images::Align::Center,
+                    Some("right") => crate::images::Align::Right,
+                    Some(other) => bail!(
+                        "blocks[{i}] (image) 의 `align` 이 `{other}` 입니다 \
+                         (받는 것: left|center|right)"
+                    ),
+                };
+                images.push(WantedImage {
+                    marker: image_marker(images.len()),
+                    bytes,
+                    ext,
+                    width,
+                    height,
+                    inline,
+                    align,
+                    path: path.to_string(),
+                });
+            }
             other => bail!(
-                "blocks[{i}] 의 `type` 이 `{other}` 입니다 (받는 것: heading|paragraph|table)"
+                "blocks[{i}] 의 `type` 이 `{other}` 입니다 \
+                 (받는 것: heading|paragraph|table|image)"
             ),
         }
     }
-    Ok(Wanted { lines, body_lines, tables, font_size_100pt, margins })
+    Ok(Wanted { lines, body_lines, tables, font_size_100pt, margins, images })
 }
 
 /// 미리보기 — **실제로 만들어 보고 버린다.**
@@ -293,6 +415,34 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
         o.remove("font_size_pt");
         o.remove("margins_mm");
     }
+    // **그림 블록은 표지 단락으로 바꿔 넘긴다.** 백엔드는 그림을 모르므로
+    // 그 자리에 단락 하나를 만들게 하고, 만든 뒤 그 단락을 **글자로** 찾아
+    // 그림을 넣고 표지를 지운다.
+    if !want.images.is_empty() {
+        let mut k = 0usize;
+        if let Some(bs) = passthrough
+            .as_object_mut()
+            .and_then(|o| o.get_mut("blocks"))
+            .and_then(|b| b.as_array_mut())
+        {
+            for b in bs.iter_mut() {
+                if b.get("type").and_then(|t| t.as_str()) == Some("image") {
+                    *b = serde_json::json!({
+                        "type": "paragraph",
+                        "text": want.images[k].marker,
+                    });
+                    k += 1;
+                }
+            }
+        }
+        if k != want.images.len() {
+            bail!(
+                "그림 블록 {}개를 표지 단락으로 바꾸려 했는데 {k}개만 바꿨습니다 — \
+                 명세의 `blocks` 가 배열이 아닐 수 있습니다",
+                want.images.len()
+            );
+        }
+    }
     std::fs::write(
         &spec_path,
         serde_json::to_vec_pretty(&passthrough).context("명세를 JSON 으로 쓸 수 없습니다")?,
@@ -319,6 +469,61 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
     // HWPX 는 ZIP + XML 이므로 고칠 수 있다. 그리고 바로 아래에서 **증인이
     // 되읽어 대조**하므로, 우리가 쓴 것도 백엔드가 쓴 것과 같은 관문을
     // 지난다 — 읽을 수 있는 것만 쓰는 이유가 그것이다.
+    // **그림을 넣는다.** 글자 크기·여백보다 먼저다 — 표지 단락을 글자로
+    // 찾아야 하고, 글자 크기를 바꾸는 것은 글자를 바꾸지 않으므로 순서가
+    // 상관없지만, 표지를 지운 뒤에 찾으면 찾을 수 없다.
+    if !want.images.is_empty() {
+        // 표지 단락의 좌표를 증인에게서 받는다 — 단락 번호를 우리가 세지 않는다
+        let pre = Testimony::read(&tmp)
+            .with_context(|| format!("만든 문서를 읽을 수 없습니다: {}", tmp.display()))?;
+        let mut spots: Vec<(usize, (u32, u32))> = Vec::new();
+        for (n, im) in want.images.iter().enumerate() {
+            let hit = pre.body_paragraphs().into_iter().find_map(|para| {
+                let i = para.index?;
+                (crate::offset::visible(&para.text).trim() == im.marker)
+                    .then_some((para.section, i))
+            });
+            match hit {
+                Some(at) => spots.push((n, at)),
+                None => bail!(
+                    "그림 {n} ({}) 을 넣을 단락을 찾지 못했습니다 — 백엔드가 표지 \
+                     글자 {:?} 를 그대로 쓰지 않았습니다",
+                    im.path, im.marker
+                ),
+            }
+        }
+        let mut pkg = crate::hwpx::Package::open(&tmp)
+            .with_context(|| format!("{} 를 풀 수 없습니다", tmp.display()))?;
+        for (n, at) in spots {
+            let im = &want.images[n];
+            let part = crate::hwpx::next_bin_part(&pkg, &im.ext)?;
+            crate::hwpx::insert_image(
+                &mut pkg, at.0, at.1, &part, im.bytes.clone(),
+                im.width, im.height, im.inline,
+                // 글자처럼 취급하는 그림의 정렬은 **문단**이 한다(실측: 실무
+                // 문서 14개의 그림 43개가 전부 개체 정렬 Left, 가운데 맞춘
+                // 그림은 문단이 가운데). 떠 있는 그림만 개체에 적는다.
+                if im.inline { crate::images::Align::Left } else { im.align },
+            )
+            .with_context(|| format!("그림 {n} ({}) 을 넣을 수 없습니다", im.path))?;
+            if im.inline && im.align != crate::images::Align::Left {
+                let owpml = match im.align {
+                    crate::images::Align::Center => "CENTER",
+                    crate::images::Align::Right => "RIGHT",
+                    crate::images::Align::Left => "LEFT",
+                };
+                crate::hwpx::set_para_align(&mut pkg, at.0, at.1, owpml)
+                    .with_context(|| format!("그림 {n} 의 문단 정렬"))?;
+            }
+            // **표지를 지운다.** 남으면 문서에 쓰레기 글자가 박힌다 —
+            // 아래 검증이 남았는지 다시 본다.
+            crate::hwpx::clear_para_text(&mut pkg, at.0, at.1)
+                .with_context(|| format!("그림 {n} 의 표지 글자를 지울 수 없습니다"))?;
+        }
+        pkg.write(&tmp)
+            .with_context(|| format!("{} 를 다시 묶을 수 없습니다", tmp.display()))?;
+    }
+
     if want.font_size_100pt.is_some() || want.margins.is_some() {
         let mut pkg = crate::hwpx::Package::open(&tmp)
             .with_context(|| format!("{} 를 풀 수 없습니다", tmp.display()))?;
@@ -367,6 +572,61 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path) -> Result<CreateReport> {
             None => diffs.push(format!(
                 "명세 {i}번째 글줄이 본문에 없습니다 (이 순서로): {line:?}"
             )),
+        }
+    }
+
+    // 1b) **표지 글자가 남았는가.** 그림을 넣고 지우는 두 단계 중 하나가
+    //     빠지면 문서에 `[[hwp-vi:image:0]]` 이 박힌다. 보이는 글자로 둔 이유가
+    //     여기 있다 — 조용히 남는 대신 검증이 집는다.
+    for im in &want.images {
+        if body.iter().any(|b| b.contains(&im.marker)) {
+            diffs.push(format!(
+                "표지 글자가 남았습니다: {:?} — 그림({})을 넣고 표지를 지우는 \
+                 두 단계 중 하나가 빠졌습니다",
+                im.marker, im.path
+            ));
+        }
+    }
+
+    // 1c) **그림이 명세대로 들어갔는가.** 백엔드가 센 수가 아니라 컨테이너를
+    //     다시 읽어 센다. 개체 수만 보면 "그림이 하나 생겼다" 까지이고 크기가
+    //     엉뚱해도 통과하므로, 놓인 크기·글자처럼취급까지 본다.
+    if !want.images.is_empty() {
+        match crate::images::read(&tmp) {
+            Ok(got) => {
+                if got.len() != want.images.len() {
+                    diffs.push(format!(
+                        "그림 수가 다릅니다 — 명세 {}개 / 만들어진 것 {}개",
+                        want.images.len(),
+                        got.len()
+                    ));
+                }
+                for (n, im) in want.images.iter().enumerate() {
+                    let hit = got.iter().any(|g| {
+                        g.placed == Some((im.width, im.height))
+                            && g.inline == im.inline
+                            && g.bytes == im.bytes
+                    });
+                    if !hit {
+                        diffs.push(format!(
+                            "그림 {n} ({}) 이 명세대로 들어가지 않았습니다 — \
+                             기대 {:.1}×{:.1}pt · {} / 읽힌 것 {:?}",
+                            im.path,
+                            im.width as f64 / 100.0,
+                            im.height as f64 / 100.0,
+                            if im.inline { "글자처럼" } else { "따로" },
+                            got.iter()
+                                .map(|g| format!(
+                                    "{:?}·{}",
+                                    g.placed,
+                                    if g.inline { "글자처럼" } else { "따로" }
+                                ))
+                                .collect::<Vec<_>>()
+                        ));
+                    }
+                }
+            }
+            Err(e) => diffs.push(format!("만든 문서의 그림을 읽을 수 없습니다: {e}")),
         }
     }
 

@@ -278,6 +278,20 @@ pub enum OpSpec {
         /// 글자처럼 취급할지. 기본 **참** — 따로 놓는 그림은 글자와 겹쳐도
         /// 아무 말이 없으므로, 묻지 않았으면 안전한 쪽으로 둔다.
         inline: Option<bool>,
+        /// `left` · `center` · `right`.
+        ///
+        /// **글자처럼 취급하는 그림(기본)이면 이것은 문단 정렬로 내려간다** —
+        /// 실측으로 정했다. 실무 문서 14개의 그림 43개는 전부 개체 정렬이
+        /// `LEFT` 이고, 가운데 맞춘 그림은 **문단**이 가운데다(center 3 ·
+        /// right 2). 개체 정렬에 적으면 실무 문서에 전례가 없는 자리에 쓰면서
+        /// 그림은 안 움직이는 연산이 된다.
+        ///
+        /// 그래서 연산이 둘로 내려간다(`insert-image` + `set-para-align`).
+        /// **그 단락에 글자가 있으면 그 글자도 같이 정렬된다** — 문단 정렬이니
+        /// 당연하고, `note` 가 그렇게 말한다.
+        ///
+        /// `inline: false` 면 떠 있는 그림이므로 `hp:pos/@horzAlign` 에 쓴다.
+        align: Option<String>,
     },
     /// 글머리 단계를 올리거나 내린다 (`Tab` / `Shift-Tab`)
     Relevel { section: u32, para: u32, delta: isize },
@@ -520,8 +534,11 @@ pub const CAPS: &[Cap] = &[
     },
     Cap {
         id: "create",
-        what: "명세에서 **새 문서를 만든다** — `font_size_pt`·`margins_mm` 으로 \
-               규격(글자 크기·여백)까지 지정한다",
+        what: "명세에서 **새 문서를 만든다** — 블록은 `heading`·`paragraph`·\
+               `table`·`image` 넷이고, `font_size_pt`·`margins_mm` 으로 \
+               규격(글자 크기·여백)까지 지정한다. 그림 블록은 \
+               `{\"type\":\"image\",\"path\":…,\"widthMm\":…}` — 한 변만 주면 \
+               나머지는 그림 비율에서 온다",
         machine: Machine::Field("create"),
         // 사람 쪽에는 없다 — 화면은 있는 문서를 여는 것부터 시작한다.
         // 이쪽은 기계 전용이고, 그래서 한 방향 강제(사람→기계)가 요구하지
@@ -1807,7 +1824,7 @@ fn lower(
             };
             (vec![Op::SetParaAlign { at: (*section, *para), align: a }], None)
         }
-        OpSpec::InsertImage { section, para, path, width_mm, height_mm, inline } => {
+        OpSpec::InsertImage { section, para, path, width_mm, height_mm, inline, align } => {
             text_at(*section, *para)?;
             let src = std::path::Path::new(path);
             let bytes = std::fs::read(src)
@@ -1865,17 +1882,60 @@ fn lower(
             })?;
             let part = hwp_core::hwpx::next_bin_part(&pkg, &ext)?;
             let inline = inline.unwrap_or(true);
+
+            use hwp_core::images::Align;
+            let want = match align.as_deref().map(str::trim) {
+                None => None,
+                Some("left") => Some(Align::Left),
+                Some("center") => Some(Align::Center),
+                Some("right") => Some(Align::Right),
+                Some(other) => anyhow::bail!(
+                    "모르는 정렬이다: {other:?} (받는 것: left, center, right)"
+                ),
+            };
+            // **글자처럼 취급하는 그림의 정렬은 문단이 한다.** 실측: 실무 문서
+            // 14개의 그림 43개가 전부 개체 정렬 `LEFT` 이고, 가운데 맞춘 그림은
+            // 문단이 가운데다(center 3 · right 2). 개체 정렬에 적으면 전례 없는
+            // 자리에 쓰면서 그림은 안 움직이는 연산이 된다.
+            let mut ops = vec![Op::InsertImage {
+                at: (*section, *para),
+                part: part.clone(),
+                bytes,
+                width: w,
+                height: h,
+                inline,
+                align: if inline { Align::Left } else { want.unwrap_or(Align::Left) },
+            }];
+            let mut extra = String::new();
+            if let Some(a) = want {
+                if inline && a != Align::Left {
+                    use hwp_core::witness::ParaAlign;
+                    let pa = match a {
+                        Align::Center => ParaAlign::Center,
+                        Align::Right => ParaAlign::Right,
+                        Align::Left => ParaAlign::Left,
+                    };
+                    ops.push(Op::SetParaAlign { at: (*section, *para), align: pa });
+                    let has_text = !cur
+                        .paras
+                        .get(&(*section, *para))
+                        .map(|t| t.trim().is_empty())
+                        .unwrap_or(true);
+                    extra = format!(
+                        ", 정렬은 **문단**으로 내렸다 ({}{})",
+                        pa.label(),
+                        if has_text { " — 이 단락의 글자도 같이 정렬된다" } else { "" }
+                    );
+                } else if inline {
+                    extra = ", 정렬 left 는 문단을 건드리지 않는다".to_string();
+                } else {
+                    extra = format!(", 개체 정렬 {a:?} (떠 있는 그림)");
+                }
+            }
             (
-                vec![Op::InsertImage {
-                    at: (*section, *para),
-                    part: part.clone(),
-                    bytes,
-                    width: w,
-                    height: h,
-                    inline,
-                }],
+                ops,
                 Some(format!(
-                    "{part} 로 들어간다 ({:.1}×{:.1}mm, {})",
+                    "{part} 로 들어간다 ({:.1}×{:.1}mm, {}{extra})",
                     w as f64 / 100.0 * 25.4 / 72.0,
                     h as f64 / 100.0 * 25.4 / 72.0,
                     if inline { "글자처럼" } else { "따로 놓기" }

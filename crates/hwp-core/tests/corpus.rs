@@ -4859,6 +4859,7 @@ fn an_image_we_insert_is_read_back_at_the_size_and_flow_we_asked_for() {
         width: W,
         height: H,
         inline: true,
+        align: hwp_core::images::Align::Left,
     });
     hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("그림 넣기: {e:#}"));
 
@@ -4930,6 +4931,7 @@ fn inserting_an_image_into_a_hwp5_file_names_the_conversion_path() {
         width: 1000,
         height: 1000,
         inline: true,
+        align: hwp_core::images::Align::Left,
     });
     let e = hwp_core::edit::save(&rhwp, &doc, &log)
         .expect_err(".hwp 에는 그림을 넣을 수 없어야 한다");
@@ -4941,5 +4943,164 @@ fn inserting_an_image_into_a_hwp5_file_names_the_conversion_path() {
         keep,
         "거부했는데 원본이 바뀌었다"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **떠 있는 그림의 가로 정렬은 개체에 적고, 되읽어 확인한다.**
+///
+/// 글자처럼 취급하는 그림은 이 자리가 아니다 — 실측(실무 문서 14개, 그림
+/// 43개): 전부 `inline` 이고 전부 개체 정렬 `Left` 이며, 가운데 맞춘 그림은
+/// **문단**이 가운데다(center 3 · right 2). 그래서 `hwp api` 의
+/// `insert-image` 는 글자처럼인 경우 `align` 을 `set-para-align` 으로 내린다.
+/// 여기서는 개체 쪽이 실제로 쓰이고 읽히는지만 본다.
+#[test]
+fn a_floating_images_alignment_is_written_on_the_object_and_read_back() {
+    let Some((rhwp, _)) = backend() else { return };
+    let Some(src) = samples()
+        .into_iter()
+        .find(|f| f.extension().and_then(|s| s.to_str()) == Some("hwpx"))
+    else {
+        return;
+    };
+    let png = {
+        let img = image::RgbImage::from_fn(4, 4, |_, y| image::Rgb([20, (y * 50) as u8, 180]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("PNG 로");
+        buf.into_inner()
+    };
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-imgal-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let doc = dir.join(src.file_name().expect("이름"));
+    std::fs::copy(&src, &doc).expect("문서");
+
+    let t = Testimony::read(&doc).expect("증인");
+    let at = t
+        .body_paragraphs()
+        .into_iter()
+        .find_map(|p| p.index.map(|i| (p.section, i)))
+        .expect("본문 단락");
+    let part = {
+        let pkg = hwp_core::hwpx::Package::open(&doc).expect("풀기");
+        hwp_core::hwpx::next_bin_part(&pkg, "png").expect("빈 이름")
+    };
+
+    let mut log = hwp_core::edit::EditLog::new();
+    log.push(hwp_core::edit::Op::InsertImage {
+        at,
+        part: part.clone(),
+        bytes: png.clone(),
+        width: 6_000,
+        height: 6_000,
+        inline: false,
+        align: hwp_core::images::Align::Center,
+    });
+    hwp_core::edit::save(&rhwp, &doc, &log).unwrap_or_else(|e| panic!("그림 넣기: {e:#}"));
+
+    let imgs = hwp_core::images::read(&doc).expect("그림 읽기");
+    let got = imgs.iter().find(|i| i.name == part).expect("넣은 그림");
+    assert_eq!(got.align, hwp_core::images::Align::Center, "개체 정렬이 다르다");
+    assert!(!got.inline, "떠 있는 그림으로 넣었다");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **그림이 든 문서를 만들기 한 번으로 낸다** — hwp-vi#6 의 둘째 요청.
+///
+/// 백엔드의 `scaffold` 는 그림을 모른다. 그래서 그 자리에 **표지 글자**가 든
+/// 단락을 만들게 하고, 만든 뒤 그 단락을 글자로 찾아 그림을 넣고 표지를
+/// 지운다. 단락 번호를 미리 세지 않는 이유: 제목 단락과 표 앵커 단락이 몇 개
+/// 더 생기는지는 백엔드가 정하고, 그 셈을 재현하면 백엔드가 바뀔 때 조용히
+/// 틀린다.
+///
+/// 보는 것 넷: 그림이 들어갔나 · 크기가 명세대로인가 · `align` 이 **문단**으로
+/// 내려갔나 · **표지가 남지 않았나**. 마지막이 이 설계의 값이다 — 두 단계 중
+/// 하나가 빠지면 문서에 `[[hwp-vi:image:0]]` 이 박힌다.
+#[test]
+fn a_spec_with_an_image_block_produces_a_document_with_that_image() {
+    let Some((rhwp, _)) = backend() else { return };
+
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-mkimg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+    let png_path = dir.join("fig.png");
+    {
+        let img = image::RgbImage::from_fn(10, 5, |x, y| {
+            image::Rgb([(x * 20) as u8, (y * 40) as u8, 120])
+        });
+        img.save(&png_path).expect("PNG 쓰기");
+    }
+    let png = std::fs::read(&png_path).expect("PNG 읽기");
+    let out = dir.join("made.hwpx");
+
+    let spec = serde_json::json!({
+        "version": "1",
+        "title": "그림이 든 문서",
+        "blocks": [
+            {"type": "heading", "level": 1, "text": "1. 흐름"},
+            {"type": "paragraph", "text": "아래가 전체 흐름이다."},
+            {"type": "image", "path": png_path.to_string_lossy(),
+             "widthMm": 80, "align": "center"},
+            {"type": "paragraph", "text": "그림 1. 흐름도"},
+        ],
+    });
+    let report = hwp_core::create::create(&rhwp, &spec, &out)
+        .unwrap_or_else(|e| panic!("만들기: {e:#}"));
+    assert_eq!(report.path, out);
+
+    // ---- 그림이 명세대로 들어갔나
+    let imgs = hwp_core::images::read(&out).expect("그림 읽기");
+    assert_eq!(imgs.len(), 1, "그림이 하나여야 한다: {imgs:?}");
+    let got = &imgs[0];
+    assert_eq!(got.bytes, png, "넣은 바이트가 그대로여야 한다");
+    assert!(got.inline, "기본은 글자처럼 취급이다");
+    // 80mm = 80 × 72 / 25.4 × 100 = 22677 (1/100 pt). 높이는 10:5 비율에서.
+    let (w, h) = got.placed.expect("놓인 크기");
+    assert_eq!(w, 22_677, "가로가 80mm 가 아니다");
+    assert_eq!(h, 11_339, "세로가 그림 비율(10:5)에서 오지 않았다");
+
+    // ---- `align` 은 **문단**으로 내려가야 한다 (실무 문서가 그렇게 한다)
+    let t = Testimony::read(&out).expect("증인");
+    let at = got.at.expect("본문 단락에 놓여야 한다");
+    let para = t
+        .body_paragraphs()
+        .into_iter()
+        .find(|p| (p.section, p.index.unwrap_or(u32::MAX)) == at)
+        .expect("그 단락");
+    assert_eq!(
+        para.style.align,
+        hwp_core::witness::ParaAlign::Center,
+        "align=center 가 문단 정렬로 내려가지 않았다"
+    );
+    assert_eq!(
+        got.align,
+        hwp_core::images::Align::Left,
+        "글자처럼 취급하는 그림의 개체 정렬은 Left 다 (실무 문서 43개 전수)"
+    );
+
+    // ---- 표지가 남지 않았나
+    for p in t.body_paragraphs() {
+        let text = hwp_core::offset::visible(&p.text);
+        assert!(
+            !text.contains("hwp-vi:image"),
+            "표지 글자가 남았다: {text:?}"
+        );
+    }
+    // 명세의 글줄은 그대로 있어야 한다
+    let body: Vec<String> = t
+        .body_paragraphs()
+        .iter()
+        .map(|p| hwp_core::offset::visible(&p.text))
+        .collect();
+    for line in ["1. 흐름", "아래가 전체 흐름이다.", "그림 1. 흐름도"] {
+        assert!(body.iter().any(|b| b.trim() == line), "{line:?} 가 없다: {body:?}");
+    }
+
+    // ---- 백엔드가 받는가
+    let back = dir.join("back.hwp");
+    rhwp.run(&["convert", &out.to_string_lossy(), &back.to_string_lossy(), "--verify"])
+        .unwrap_or_else(|e| panic!("백엔드가 만든 문서를 거부했다: {e:#}"));
+
     let _ = std::fs::remove_dir_all(&dir);
 }

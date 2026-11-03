@@ -154,6 +154,13 @@ pub enum Op {
         height: u32,
         /// 글자처럼 취급 — 참이면 본문 줄에 섞인다.
         inline: bool,
+        /// **개체 가로 정렬 — 떠 있는 그림만 뜻이 있다.**
+        ///
+        /// 실측(실무 문서 14개, 그림 43개): 전부 `inline` 이고 전부 `Left` 다.
+        /// 가운데 맞춘 그림은 **문단**이 가운데다(center 3 · right 2). 그래서
+        /// 글자처럼 취급하는 그림을 가운데 두려면 이 칸이 아니라
+        /// `SetParaAlign` 이다 — `hwp api` 의 `insert-image` 가 그렇게 내린다.
+        align: crate::images::Align,
     },
     /// `edit delete-table` — 표를 지운다. **단락은 남는다.**
     ///
@@ -371,9 +378,9 @@ impl Op {
             Op::SetParaAlign { at, align } => {
                 crate::hwpx::set_para_align(&mut pkg, at.0, at.1, align.owpml())?;
             }
-            Op::InsertImage { at, part, bytes, width, height, inline } => {
+            Op::InsertImage { at, part, bytes, width, height, inline, align } => {
                 crate::hwpx::insert_image(
-                    &mut pkg, at.0, at.1, part, bytes.clone(), *width, *height, *inline,
+                    &mut pkg, at.0, at.1, part, bytes.clone(), *width, *height, *inline, *align,
                 )?;
             }
             other => bail!("우리가 직접 할 수 있는 연산이 아닙니다: {}", other.describe()),
@@ -420,7 +427,7 @@ impl Op {
                     what.join(" · ")
                 )
             }
-            Op::InsertImage { at, part, bytes, width, height, inline } => format!(
+            Op::InsertImage { at, part, bytes, width, height, inline, .. } => format!(
                 "구역{} 단락{} 에 그림 넣기 — {part} ({}KB, {:.1}×{:.1}pt, {})",
                 at.0, at.1,
                 (bytes.len() + 512) / 1024,
@@ -645,6 +652,10 @@ pub struct ImageFact {
     /// 문서에 **놓인** 크기 (HWPUNIT). 픽셀 크기가 아니다.
     pub placed: Option<(u32, u32)>,
     pub inline: bool,
+    /// 개체 가로 정렬. 글자처럼 취급하는 그림은 실무 문서에서 **전부 `Left`**
+    /// 이고(43개 전수) 가운데 맞춤은 **문단**이 한다 — 그래도 축에는 든다.
+    /// 쓴 것을 되읽어 대조할 수 있으면 드는 것이 기본값이다.
+    pub align: crate::images::Align,
     pub bytes: usize,
 }
 
@@ -697,6 +708,7 @@ pub fn image_facts(path: &Path) -> (BTreeMap<Coord, Vec<ImageFact>>, Vec<ImageFa
         let fact = ImageFact {
             placed: i.placed,
             inline: i.inline,
+            align: i.align,
             bytes: i.bytes.len(),
         };
         match i.at {
@@ -1014,7 +1026,7 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 *p = next;
                 *slot = paras.join("\n");
             }
-            Op::InsertImage { at, part, bytes, width, height, inline } => {
+            Op::InsertImage { at, part, bytes, width, height, inline, align } => {
                 if !cur.paras.contains_key(at) {
                     bail!(
                         "없는 단락에 그림을 넣으려 합니다: 구역{} 단락{}",
@@ -1031,6 +1043,7 @@ pub fn expected(before: &Snapshot, ops: &[Op]) -> Result<Snapshot> {
                 slot.push(ImageFact {
                     placed: Some((*width, *height)),
                     inline: *inline,
+                    align: *align,
                     bytes: bytes.len(),
                 });
                 // 단락 안 순서는 비교하지 않으므로 정렬해 둔다 — 증인 쪽도
@@ -1402,10 +1415,11 @@ fn diff_report(
             let say = |f: &ImageFact| {
                 let (x, y) = f.placed.unwrap_or((0, 0));
                 format!(
-                    "{:.1}×{:.1}pt · {} · {}B",
+                    "{:.1}×{:.1}pt · {} · {:?} · {}B",
                     x as f64 / 100.0,
                     y as f64 / 100.0,
                     if f.inline { "글자처럼" } else { "따로" },
+                    f.align,
                     f.bytes
                 )
             };

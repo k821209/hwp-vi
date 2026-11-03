@@ -423,6 +423,7 @@ pub fn insert_image(
     width: u32,
     height: u32,
     inline: bool,
+    align: crate::images::Align,
 ) -> Result<String> {
     let hpf_name = "Contents/content.hpf";
     let Some(mut hpf) = pkg.text(hpf_name) else {
@@ -504,7 +505,7 @@ pub fn insert_image(
             ),
         }
     };
-    let pic = pic_xml(&id, width, height, inline);
+    let pic = pic_xml(&id, width, height, inline, align);
     let mut sec2 = sec.clone();
     sec2.insert_str(p_start + run_end_rel, &pic);
     pkg.set_text(&sec_name, sec2);
@@ -546,8 +547,17 @@ fn find_body_para(sec: &str, para: u32) -> Result<(usize, usize)> {
 }
 
 /// `hp:pic` 한 벌. 크기를 **여섯 곳**에 같은 수로 적는다.
-fn pic_xml(id: &str, w: u32, h: u32, inline: bool) -> String {
+fn pic_xml(id: &str, w: u32, h: u32, inline: bool, align: crate::images::Align) -> String {
     let as_char = if inline { "1" } else { "0" };
+    // **개체 정렬.** 실측(실무 문서 14개, 그림 43개): 전부 `LEFT` 다 — 가운데
+    // 맞춘 그림은 **문단**이 가운데다(center 3 · right 2). 그래서 글자처럼
+    // 취급하는 그림의 정렬은 부르는 쪽에서 `set-para-align` 으로 가고, 이
+    // 속성은 떠 있는 그림에만 쓴다.
+    let horz = match align {
+        crate::images::Align::Center => "CENTER",
+        crate::images::Align::Right => "RIGHT",
+        crate::images::Align::Left => "LEFT",
+    };
     // 글자처럼이면 글자 흐름을 따르므로 기준은 단락(`PARA`)이고, 떠 있는
     // 그림이면 용지(`PAPER`)다 — 실물에서 본 조합이다.
     let rel = if inline { "PARA" } else { "PAPER" };
@@ -575,7 +585,7 @@ fn pic_xml(id: &str, w: u32, h: u32, inline: bool) -> String {
             r#"<hp:sz width="{w}" widthRelTo="ABSOLUTE" height="{h}" heightRelTo="ABSOLUTE" protect="0"/>"#,
             r#"<hp:pos treatAsChar="{c}" affectLSpacing="0" flowWithText="1" allowOverlap="0""#,
             r#" holdAnchorAndSO="0" vertRelTo="{rel}" horzRelTo="{rel}" vertAlign="TOP""#,
-            r#" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>"#,
+            r#" horzAlign="{horz}" vertOffset="0" horzOffset="0"/>"#,
             r#"<hp:outMargin left="0" right="0" top="0" bottom="0"/>"#,
             r#"</hp:pic>"#,
         ),
@@ -583,8 +593,43 @@ fn pic_xml(id: &str, w: u32, h: u32, inline: bool) -> String {
         h = h,
         id = id,
         c = as_char,
-        rel = rel
+        rel = rel,
+        horz = horz
     )
+}
+
+/// **그 단락의 글자를 비운다.** 구간과 `hp:pic` 은 그대로 둔다.
+///
+/// `create` 의 그림 블록이 쓴다: 백엔드의 `scaffold` 는 그림을 모르므로 그
+/// 자리에 **표지 글자**가 든 단락을 하나 만들게 하고, 그 단락을 찾아 그림을
+/// 넣은 뒤 표지를 지운다. 표지를 남기면 문서에 쓰레기 글자가 박힌다.
+///
+/// `<hp:t>…</hp:t>` 의 **내용만** 비우는 이유: 태그째 지우면 구간(`hp:run`)이
+/// 글자 없는 꼴이 되는데 그게 스키마에 맞는지 재지 않았다. 빈 `hp:t` 는
+/// 실물에 있다.
+pub fn clear_para_text(pkg: &mut Package, section: u32, para: u32) -> Result<usize> {
+    let name = format!("Contents/section{section}.xml");
+    let Some(xml) = pkg.text(&name) else {
+        bail!("구역 {section} 이 없습니다 ({name})");
+    };
+    let (p_start, p_end) = find_body_para(&xml, para)?;
+    let mut out = String::with_capacity(xml.len());
+    out.push_str(&xml[..p_start]);
+    let mut rest = &xml[p_start..p_end];
+    let mut cleared = 0usize;
+    while let Some(s0) = rest.find("<hp:t>") {
+        let body = s0 + "<hp:t>".len();
+        let Some(e0) = rest[body..].find("</hp:t>").map(|i| i + body) else { break };
+        out.push_str(&rest[..body]);
+        if e0 > body {
+            cleared += 1;
+        }
+        rest = &rest[e0..];
+    }
+    out.push_str(rest);
+    out.push_str(&xml[p_end..]);
+    pkg.set_text(&name, out);
+    Ok(cleared)
 }
 
 /// mm → HWPUNIT (1/7200 inch).
@@ -637,7 +682,7 @@ mod pic_tests {
     /// 맞춰 둔다 — "원래 크기 w×h, 놓인 크기 w×h, 늘이지 않음".
     #[test]
     fn 그림_크기는_일곱_자리에_같은_수로_적힌다() {
-        let xml = pic_xml("image7", 15600, 2400, true);
+        let xml = pic_xml("image7", 15600, 2400, true, crate::images::Align::Left);
         for attr in [
             r#"<hp:orgSz width="15600" height="2400"/>"#,
             r#"<hp:curSz width="15600" height="2400"/>"#,
@@ -665,12 +710,15 @@ mod pic_tests {
     /// 글자처럼취급은 `hp:pos/@treatAsChar` 한 곳이고, 기준 좌표가 함께 간다.
     #[test]
     fn 글자처럼_여부가_기준_좌표까지_바꾼다() {
-        let inline = pic_xml("i", 100, 100, true);
+        let inline = pic_xml("i", 100, 100, true, crate::images::Align::Left);
         assert!(inline.contains(r#"treatAsChar="1""#), "{inline}");
         assert!(inline.contains(r#"vertRelTo="PARA""#), "{inline}");
-        let float = pic_xml("i", 100, 100, false);
+        let float = pic_xml("i", 100, 100, false, crate::images::Align::Center);
         assert!(float.contains(r#"treatAsChar="0""#), "{float}");
         assert!(float.contains(r#"vertRelTo="PAPER""#), "{float}");
+        // 떠 있는 그림만 개체 정렬을 쓴다 — 글자처럼은 문단이 한다
+        assert!(float.contains(r#"horzAlign="CENTER""#), "{float}");
+        assert!(inline.contains(r#"horzAlign="LEFT""#), "{inline}");
     }
 
     /// **이미 있는 이름에는 넣지 않는다.** 덮으면 그 그림이 조용히 사라진다.
@@ -682,7 +730,7 @@ mod pic_tests {
         }
         let mut pkg = Package::open(src).expect("풀기");
         // c00 은 image1·image2 를 쓴다
-        let e = insert_image(&mut pkg, 0, 0, "BinData/image1.png", vec![1, 2, 3], 100, 100, true)
+        let e = insert_image(&mut pkg, 0, 0, "BinData/image1.png", vec![1, 2, 3], 100, 100, true, crate::images::Align::Left)
             .expect_err("있는 이름이면 거부해야 한다");
         assert!(format!("{e}").contains("이미 있습니다"), "{e}");
         // 다음 빈 이름은 그 둘을 피한다

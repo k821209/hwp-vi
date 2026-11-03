@@ -78,7 +78,7 @@ pub struct ImageCell {
 }
 
 /// 그림의 가로 정렬.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Align {
     #[default]
     Left,
