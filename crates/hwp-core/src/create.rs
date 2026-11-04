@@ -84,6 +84,8 @@ struct Wanted {
     margins: Option<Margins>,
     /// 명세 `blocks` 의 **순서**. 만든 뒤 블록이 어디로 갔는지 돌려주는 데 쓴다.
     order: Vec<BlockKind>,
+    /// 블록마다 직접 붙인 서식. 순서는 `order` 와 같다.
+    formats: Vec<BlockFormat>,
     /// 그림 블록들. 백엔드의 `scaffold` 는 그림을 모르므로, 그 자리에
     /// **표지 글자**가 든 단락을 만들게 하고 만든 뒤 우리가 그림을 넣는다.
     images: Vec<WantedImage>,
@@ -125,6 +127,127 @@ pub struct BlockAt {
     pub table: Option<u32>,
     /// 그림 부품 이름 — 그림 블록만.
     pub name: Option<String>,
+}
+
+/// 블록마다의 본문 단락 좌표. **글줄을 앞에서부터 훑어** 맞춘다 — 같은 글자가
+/// 두 번 나와도 순서대로 갈린다.
+///
+/// 검증·보고서·블록 서식이 **같은 함수**를 쓴다. 좌표 셈을 여러 군데 두면
+/// 반드시 어긋난다(이 저장소에서 여러 번 당했다).
+fn block_coords(
+    witness: &Testimony,
+    want: &Wanted,
+    image_at: &[Option<(u32, u32)>],
+) -> Vec<Option<(u32, u32)>> {
+    let body: Vec<String> = witness
+        .body_paragraphs()
+        .iter()
+        .map(|p| crate::offset::visible(&p.text))
+        .collect();
+    let coords: Vec<(u32, u32)> = witness
+        .body_paragraphs()
+        .iter()
+        .map(|p| (p.section, p.index.unwrap_or(0)))
+        .collect();
+    let mut line_at: Vec<Option<(u32, u32)>> = vec![None; want.lines.len()];
+    let mut at = 0usize;
+    for (i, line) in want.lines.iter().enumerate() {
+        if let Some(k) = body[at..].iter().position(|b| b.trim() == line.trim()) {
+            line_at[i] = coords.get(at + k).copied();
+            at += k + 1;
+        }
+    }
+    want
+        .order
+        .iter()
+        .map(|b| match b {
+            BlockKind::Line(n) => line_at.get(*n).copied().flatten(),
+            // 표는 앵커 단락을 증인이 모른다 — 지어내지 않는다
+            BlockKind::Table(_) => None,
+            BlockKind::Image(n) => image_at.get(*n).copied().flatten(),
+        })
+        .collect()
+}
+
+/// 블록 하나에 **직접 붙인 서식**. 전부 선택이고, 준 것만 건드린다.
+///
+/// 왜 블록에 붙이나. 전에는 만든 뒤 좌표를 찾아 `ops` 로 따로 걸어야 했다 —
+/// `blocksAt` 이 생겨 좌표는 알 수 있게 됐지만, 여전히 **두 번 부르는 일**이고
+/// 그 사이에 문서가 한 번 더 열리고 닫힌다. 교재처럼 제목이 수십 개면
+/// 그만큼 왕복이 는다.
+///
+/// 기본값은 **바꾸지 않는다.** 아무것도 안 주면 전과 똑같이 나온다 —
+/// 이미 쓰고 계신 명세가 다르게 보이면 안 된다.
+///
+/// 받는 것은 전부 **증인이 읽는 축**이다. 색·음영·테두리는 아직 못 읽으므로
+/// 받지 않는다(읽지 못하는 것은 쓰지 않는다).
+#[derive(Debug, Clone, Default)]
+struct BlockFormat {
+    size_100pt: Option<u32>,
+    font: Option<String>,
+    align: Option<String>,
+    space_before: Option<i64>,
+    space_after: Option<i64>,
+    numbered: Option<bool>,
+}
+
+impl BlockFormat {
+    fn is_empty(&self) -> bool {
+        self.size_100pt.is_none()
+            && self.font.is_none()
+            && self.align.is_none()
+            && self.space_before.is_none()
+            && self.space_after.is_none()
+            && self.numbered.is_none()
+    }
+
+    fn parse(b: &Value, i: usize) -> Result<Self> {
+        let pt = |k: &str| -> Result<Option<i64>> {
+            match b.get(k) {
+                None | Some(Value::Null) => Ok(None),
+                Some(v) => v
+                    .as_f64()
+                    .filter(|x| x.is_finite() && *x >= 0.0)
+                    .map(|x| Some((x * 100.0).round() as i64))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("blocks[{i}] 의 `{k}` 가 0 이상의 수가 아닙니다: {v}")
+                    }),
+            }
+        };
+        let size = match b.get("sizePt") {
+            None | Some(Value::Null) => None,
+            Some(v) => {
+                let x = v
+                    .as_f64()
+                    .filter(|x| x.is_finite() && *x > 0.0)
+                    .ok_or_else(|| anyhow::anyhow!("blocks[{i}] 의 `sizePt` 가 양수가 아닙니다: {v}"))?;
+                Some((x * 100.0).round() as u32)
+            }
+        };
+        let align = match b.get("align").and_then(|v| v.as_str()).map(str::trim) {
+            None => None,
+            Some(a @ ("justify" | "left" | "right" | "center" | "distribute" | "division")) => {
+                Some(a.to_uppercase())
+            }
+            Some(other) => bail!(
+                "blocks[{i}] 의 `align` 이 `{other}` 입니다 \
+                 (받는 것: justify|left|right|center|distribute|division)"
+            ),
+        };
+        Ok(Self {
+            size_100pt: size,
+            font: b
+                .get("font")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .map(str::to_string),
+            align,
+            space_before: pt("spaceBeforePt")?,
+            space_after: pt("spaceAfterPt")?,
+            numbered: b.get("numbered").and_then(|v| v.as_bool()),
+        })
+    }
 }
 
 /// 명세의 `{"type":"image", …}` 하나.
@@ -242,8 +365,12 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
     let mut tables = Vec::new();
     let mut images: Vec<WantedImage> = Vec::new();
     let mut order: Vec<BlockKind> = Vec::new();
+    let mut formats: Vec<BlockFormat> = Vec::new();
     for (i, b) in blocks.iter().enumerate() {
         let kind = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        // 블록 서식은 종류와 무관하게 같은 칸으로 받는다 — 제목만 되는 칸을
+        // 따로 두면 받는 쪽이 종류마다 다른 규칙을 외워야 한다.
+        formats.push(BlockFormat::parse(b, i)?);
         match kind {
             "heading" | "paragraph" => {
                 let t = b.get("text").and_then(|t| t.as_str()).ok_or_else(|| {
@@ -379,7 +506,7 @@ fn wanted_from(spec: &Value) -> Result<Wanted> {
             ),
         }
     }
-    Ok(Wanted { lines, body_lines, tables, font_size_100pt, margins, images, order })
+    Ok(Wanted { lines, body_lines, tables, font_size_100pt, margins, images, order, formats })
 }
 
 /// 미리보기 — **실제로 만들어 보고 버린다.**
@@ -490,6 +617,28 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result
         o.remove("font_size_pt");
         o.remove("margins_mm");
     }
+    // **블록에 붙인 우리 칸도 떼어 낸다.** 백엔드의 `scaffold` 는 모르는 칸을
+    // 거부한다(그게 맞다 — 오타를 조용히 무시하는 것보다 낫다). 위쪽
+    // `font_size_pt`·`margins_mm` 와 같은 처리다.
+    const OURS: &[&str] = &[
+        "sizePt", "font", "align", "spaceBeforePt", "spaceAfterPt", "numbered",
+    ];
+    if let Some(bs) = passthrough
+        .as_object_mut()
+        .and_then(|o| o.get_mut("blocks"))
+        .and_then(|b| b.as_array_mut())
+    {
+        for b in bs.iter_mut() {
+            // 그림 블록의 `align` 은 **우리가 쓰는 것**이고 아래에서 표지
+            // 단락으로 통째로 바뀌므로 여기서 떼어도 잃는 것이 없다.
+            if let Some(o) = b.as_object_mut() {
+                for k in OURS {
+                    o.remove(*k);
+                }
+            }
+        }
+    }
+
     // **그림 블록은 표지 단락으로 바꿔 넘긴다.** 백엔드는 그림을 모르므로
     // 그 자리에 단락 하나를 만들게 하고, 만든 뒤 그 단락을 **글자로** 찾아
     // 그림을 넣고 표지를 지운다.
@@ -677,6 +826,74 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result
             .with_context(|| format!("{} 를 다시 묶을 수 없습니다", tmp.display()))?;
     }
 
+    // **블록마다 붙인 서식을 적용한다.** 좌표는 바로 아래 증인이 주므로,
+    // 먼저 한 번 읽어 자리를 잡고 고친 뒤 다시 읽어 대조한다.
+    //
+    // 전에는 만든 뒤 부르는 쪽이 `ops` 로 따로 걸어야 했다 — `blocksAt` 으로
+    // 좌표는 알 수 있게 됐지만 여전히 두 번 부르는 일이고, 교재처럼 제목이
+    // 수십 개면 그만큼 왕복이 는다.
+    if want.formats.iter().any(|f| !f.is_empty()) {
+        let pre = Testimony::read(&tmp)
+            .with_context(|| format!("만든 문서를 읽을 수 없습니다: {}", tmp.display()))?;
+        let spots = block_coords(&pre, &want, &image_at);
+        let mut pkg = crate::hwpx::Package::open(&tmp)
+            .with_context(|| format!("{} 를 풀 수 없습니다", tmp.display()))?;
+        for (n, fmt) in want.formats.iter().enumerate() {
+            if fmt.is_empty() {
+                continue;
+            }
+            let Some(at) = spots.get(n).copied().flatten() else {
+                // 표 블록처럼 단락 좌표가 없는 것 — 조용히 넘기지 않는다
+                warnings.push(format!(
+                    "blocks[{n}] 의 서식을 걸 자리를 찾지 못했습니다 — \
+                     표 블록에는 문단 서식을 걸 수 없습니다(칸마다 다르기 때문입니다)."
+                ));
+                continue;
+            };
+            let space = match (fmt.space_before, fmt.space_after) {
+                (None, None) => None,
+                // 한쪽만 줬으면 나머지는 0 이 아니라 **지금 값**이어야 한다.
+                // 만들기 직후라 지금 값은 증인이 읽은 그것이다.
+                (b, a) => {
+                    let st = pre
+                        .body_paragraphs()
+                        .into_iter()
+                        .find(|p| (p.section, p.index.unwrap_or(u32::MAX)) == at)
+                        .map(|p| p.style)
+                        .unwrap_or_default();
+                    Some((
+                        b.unwrap_or(st.space_before),
+                        a.unwrap_or(st.space_after),
+                    ))
+                }
+            };
+            if fmt.align.is_some() || space.is_some() || fmt.numbered.is_some() {
+                crate::hwpx::set_para_style(
+                    &mut pkg,
+                    at.0,
+                    at.1,
+                    fmt.align.as_deref(),
+                    None,
+                    space,
+                    fmt.numbered,
+                )
+                .with_context(|| format!("blocks[{n}] 의 문단 서식"))?;
+            }
+            if fmt.size_100pt.is_some() || fmt.font.is_some() {
+                crate::hwpx::set_para_char(
+                    &mut pkg,
+                    at.0,
+                    at.1,
+                    fmt.size_100pt,
+                    fmt.font.as_deref(),
+                )
+                .with_context(|| format!("blocks[{n}] 의 글자 서식"))?;
+            }
+        }
+        pkg.write(&tmp)
+            .with_context(|| format!("{} 를 다시 묶을 수 없습니다", tmp.display()))?;
+    }
+
     // **독립 대조.** 백엔드가 센 수를 받아 적지 않고 증인이 직접 읽는다.
     let witness = Testimony::read(&tmp)
         .with_context(|| format!("만든 문서를 다시 읽을 수 없습니다: {}", tmp.display()))?;
@@ -696,24 +913,18 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result
     //
     // 앞에서부터 훑으므로 **같은 글자가 두 번 나와도** 순서대로 갈린다.
     // 되읽어 집합으로 맞추면 그게 깨진다(사용자가 그렇게 우회하고 계셨다).
-    let coords: Vec<(u32, u32)> = witness
-        .body_paragraphs()
-        .iter()
-        .map(|p| (p.section, p.index.unwrap_or(0)))
-        .collect();
-    let mut line_at: Vec<Option<(u32, u32)>> = vec![None; want.lines.len()];
     let mut at = 0usize;
     for (i, line) in want.lines.iter().enumerate() {
         match body[at..].iter().position(|b| b.trim() == line.trim()) {
-            Some(k) => {
-                line_at[i] = coords.get(at + k).copied();
-                at += k + 1;
-            }
+            Some(k) => at += k + 1,
             None => diffs.push(format!(
                 "명세 {i}번째 글줄이 본문에 없습니다 (이 순서로): {line:?}"
             )),
         }
     }
+    // 블록 → 좌표는 **한 군데서** 센다 — 검증·보고서·블록 서식이 같은 함수를
+    // 쓴다. 좌표 셈을 여러 군데 두면 반드시 어긋난다.
+    let block_at = block_coords(&witness, &want, &image_at);
 
     // 1b) **표지 글자가 남았는가.** 그림을 넣고 지우는 두 단계 중 하나가
     //     빠지면 문서에 `[[hwp-vi:image:0]]` 이 박힌다. 보이는 글자로 둔 이유가
@@ -767,6 +978,73 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result
                 }
             }
             Err(e) => diffs.push(format!("만든 문서의 그림을 읽을 수 없습니다: {e}")),
+        }
+    }
+
+    // 1d) **블록에 붙인 서식이 실제로 들어갔는가.** 받고 조용히 무시하는
+    //     것이 이 저장소가 가장 경계하는 꼴이다(hwp-vi#7·#9 가 둘 다 그
+    //     모양이었다). 전부 증인이 읽는 축이므로 되읽어 대조한다.
+    for (n, fmt) in want.formats.iter().enumerate() {
+        if fmt.is_empty() {
+            continue;
+        }
+        let Some(at) = block_at.get(n).copied().flatten() else { continue };
+        let Some(p) = witness
+            .body_paragraphs()
+            .into_iter()
+            .find(|p| (p.section, p.index.unwrap_or(u32::MAX)) == at)
+        else {
+            diffs.push(format!("blocks[{n}] 의 자리 {at:?} 를 되읽지 못했습니다"));
+            continue;
+        };
+        if let Some(h) = fmt.size_100pt {
+            let got: Vec<u32> = p.runs.iter().map(|r| r.size_100pt).collect();
+            if !got.is_empty() && !got.iter().all(|g| *g == h) {
+                diffs.push(format!(
+                    "blocks[{n}] 의 글자 크기가 다릅니다 — 명세 {:.1}pt / 만들어진 것 {:?}pt",
+                    h as f64 / 100.0,
+                    got.iter().map(|g| *g as f64 / 100.0).collect::<Vec<_>>()
+                ));
+            }
+        }
+        if let Some(f) = &fmt.font {
+            if let Some(bad) = p.runs.iter().find(|r| &r.font != f || &r.font_latin != f) {
+                diffs.push(format!(
+                    "blocks[{n}] 의 글꼴이 다릅니다 — 명세 {f:?} / 만들어진 것 \
+                     (한글 {:?}, 라틴 {:?})",
+                    bad.font, bad.font_latin
+                ));
+            }
+        }
+        if let Some(a) = &fmt.align {
+            let got = format!("{:?}", p.style.align).to_uppercase();
+            if &got != a {
+                diffs.push(format!(
+                    "blocks[{n}] 의 정렬이 다릅니다 — 명세 {a} / 만들어진 것 {got}"
+                ));
+            }
+        }
+        for (what, want_v, got_v) in [
+            ("위 간격", fmt.space_before, p.style.space_before),
+            ("아래 간격", fmt.space_after, p.style.space_after),
+        ] {
+            if let Some(w) = want_v {
+                if w != got_v {
+                    diffs.push(format!(
+                        "blocks[{n}] 의 문단 {what}이 다릅니다 — 명세 {:.1}pt / 만들어진 것 {:.1}pt",
+                        w as f64 / 100.0,
+                        got_v as f64 / 100.0
+                    ));
+                }
+            }
+        }
+        if let Some(num) = fmt.numbered {
+            if num != p.style.numbered {
+                diffs.push(format!(
+                    "blocks[{n}] 의 자동 개요 번호가 다릅니다 — 명세 {num} / 만들어진 것 {}",
+                    p.style.numbered
+                ));
+            }
         }
     }
 
@@ -828,8 +1106,25 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result
     // 확인할 수 없으면 적지 않는다.
     if let Some(want_h) = want.font_size_100pt.filter(|_| size_applied) {
         // 본문 글줄이 그 크기로 되읽히는가
+        // **블록이 자기 크기를 주면 그쪽이 이긴다.** 문서 전체 크기는
+        // 기본값이고, 블록에 붙인 것은 그 블록에 대한 말이다. 둘을 다
+        // 요구하면 "코드는 9.5pt" 같은 평범한 명세가 거부된다.
+        let own_size: std::collections::BTreeSet<&str> = want
+            .order
+            .iter()
+            .zip(&want.formats)
+            .filter_map(|(b, f)| match b {
+                BlockKind::Line(n) if f.size_100pt.is_some() => {
+                    want.lines.get(*n).map(String::as_str)
+                }
+                _ => None,
+            })
+            .collect();
         let mut seen = 0usize;
         for line in &want.body_lines {
+            if own_size.contains(line.as_str()) {
+                continue;
+            }
             let Some(p) = witness
                 .body_paragraphs()
                 .into_iter()
@@ -962,7 +1257,7 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result
                     } else {
                         "heading".into()
                     },
-                    at: line_at.get(*n).copied().flatten(),
+                    at: block_at.get(i).copied().flatten(),
                     table: None,
                     name: None,
                 },
@@ -977,7 +1272,7 @@ pub fn create(rhwp: &Rhwp, spec: &Value, dest: &Path, overwrite: bool) -> Result
                 BlockKind::Image(n) => BlockAt {
                     index: i,
                     kind: "image".into(),
-                    at: image_at.get(*n).copied().flatten(),
+                    at: block_at.get(i).copied().flatten(),
                     table: None,
                     name: image_name.get(*n).cloned().flatten(),
                 },

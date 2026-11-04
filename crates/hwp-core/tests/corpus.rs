@@ -6422,3 +6422,79 @@ fn outline_numbering_can_be_turned_off() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **블록에 붙인 서식이 한 번의 `create` 로 들어간다.**
+///
+/// 전에는 만든 뒤 좌표를 찾아 `ops` 로 따로 걸어야 했다. `blocksAt` 으로
+/// 좌표는 알 수 있게 됐지만 여전히 **두 번 부르는 일**이고, 교재처럼 제목이
+/// 수십 개면 그만큼 왕복이 는다.
+///
+/// 받는 것은 전부 **증인이 읽는 축**이다 — 크기·글꼴·정렬·문단 간격·자동
+/// 번호. 색·음영·테두리는 아직 못 읽으므로 받지 않는다.
+///
+/// **기본값은 바뀌지 않는다**: 아무것도 안 주면 전과 똑같이 나온다.
+#[test]
+fn per_block_formatting_lands_in_one_create_call() {
+    let Some((rhwp, _)) = backend() else { return };
+    let dir = std::env::temp_dir().join(format!("hwp-cmd-blkfmt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("폴더");
+    let out = dir.join("fmt.hwpx");
+
+    const CODE: &str = "bwa-mem2 mem -t 16 ref.fa | samtools sort -o S1.bam -";
+    const CAP: &str = "그림 1. 분석 흐름도";
+    let spec = serde_json::json!({
+        "version": "1", "title": "교재", "font_size_pt": 11,
+        "blocks": [
+            {"type": "heading", "level": 1, "text": "제3장 진핵생물 데이터 분석",
+             "sizePt": 15, "spaceBeforePt": 12, "spaceAfterPt": 4, "numbered": false},
+            {"type": "paragraph", "text": "본문 한 줄."},
+            // 코드 — 고정폭, 작은 글자
+            {"type": "paragraph", "text": CODE, "font": "D2Coding", "sizePt": 9.5},
+            // 캡션 — 가운데, 작은 글자, 아래 간격
+            {"type": "paragraph", "text": CAP, "align": "center", "sizePt": 9.5, "spaceAfterPt": 8},
+        ],
+    });
+    let r = hwp_core::create::create(&rhwp, &spec, &out, false)
+        .unwrap_or_else(|e| panic!("만들기: {e:#}"));
+    assert!(r.warnings.is_empty(), "경고가 났다: {:?}", r.warnings);
+
+    let t = Testimony::read(&out).expect("증인");
+    let find = |text: &str| {
+        t.body_paragraphs()
+            .into_iter()
+            .find(|p| hwp_core::offset::visible(&p.text).trim() == text)
+            .unwrap_or_else(|| panic!("{text:?} 를 찾지 못했다"))
+    };
+
+    // ---- 제목: 큰 글자 · 간격 · 자동 번호 꺼짐
+    let h = find("제3장 진핵생물 데이터 분석");
+    assert!(h.runs.iter().all(|x| x.size_100pt == 1_500), "제목 크기: {:?}", h.runs);
+    assert_eq!(h.style.space_before, 1_200, "제목 위 간격");
+    assert_eq!(h.style.space_after, 400, "제목 아래 간격");
+    assert!(!h.style.numbered, "제목의 자동 번호가 꺼져야 한다");
+
+    // ---- 코드: 고정폭 · 작은 글자. **한글과 라틴 둘 다** 여야 한다
+    let c = find(CODE);
+    assert!(
+        c.runs.iter().all(|x| x.font == "D2Coding" && x.font_latin == "D2Coding"),
+        "코드 글꼴: {:?}",
+        c.runs.iter().map(|x| (&x.font, &x.font_latin)).collect::<Vec<_>>()
+    );
+    assert!(c.runs.iter().all(|x| x.size_100pt == 950), "코드 크기: {:?}", c.runs);
+
+    // ---- 캡션: 가운데 · 아래 간격
+    let cap = find(CAP);
+    assert_eq!(cap.style.align, hwp_core::witness::ParaAlign::Center, "캡션 정렬");
+    assert_eq!(cap.style.space_after, 800, "캡션 아래 간격");
+
+    // ---- **안 준 블록은 문서 기본값 그대로** — 말하지 않은 것을 바꾸지 않는다
+    let body = find("본문 한 줄.");
+    assert!(body.runs.iter().all(|x| x.size_100pt == 1_100), "본문 크기: {:?}", body.runs);
+    assert_eq!(body.style.space_before, 0, "안 준 블록에 간격이 생겼다");
+
+    rhwp.run(&["convert", &out.to_string_lossy(), &dir.join("b.hwp").to_string_lossy(), "--verify"])
+        .unwrap_or_else(|e| panic!("백엔드가 거부했다: {e:#}"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
